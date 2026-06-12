@@ -120,6 +120,11 @@ static float sstep(float x){ x=clampf(x,0,1); return x*x*(3-2*x); }
 static float easeOutBack(float x){ x=clampf(x,0,1); float c=1.70158f,k=x-1;
   return 1.0f+(c+1.0f)*k*k*k+c*k*k; }
 static float toward(float v,float t,float k){ return v+(t-v)*clampf(k,0,1); }
+/* like toward, but on an angle: takes the short way around */
+static float angto(float a,float b,float k){
+  float d=fmodf(b-a+PI,2*PI); if(d<0)d+=2*PI; d-=PI;
+  return a+d*clampf(k,0,1);
+}
 
 /* ---------------------------------------------------------------- mat3 (col-major) */
 static void m3id(float*m){ memset(m,0,36); m[0]=m[4]=m[8]=1; }
@@ -366,6 +371,19 @@ static int solid(int cx,int cz){ if(cx<0||cz<0||cx>=G||cz>=G)return 1; return gr
 static float cellh(int cx,int cz){
   if(cx<0||cz<0||cx>=G||cz>=G)return 1e9f;
   return grid[cz][cx]? 1e9f : hgt[cz][cx];
+}
+/* floor height at a point, with solid cells flattened to ground level —
+ * for effects and pickups that just need somewhere to sit */
+static float floor_at(float x,float z){
+  float h=cellh((int)floorf(x/CELL),(int)floorf(z/CELL));
+  return h>100.0f?0:h;
+}
+/* does a circle at (x,z) overlap cell (cx,cz)? */
+static int circ_cell(float x,float z,float r,int cx,int cz){
+  float bx0=cx*CELL,bx1=bx0+CELL,bz0=cz*CELL,bz1=bz0+CELL;
+  float nx=x<bx0?bx0:(x>bx1?bx1:x), nz=z<bz0?bz0:(z>bz1?bz1:z);
+  float dx=x-nx,dz=z-nz;
+  return dx*dx+dz*dz < r*r;
 }
 static void carve(int x,int y,int w,int h){
   for(int j=y;j<y+h;j++)for(int i=x;i<x+w;i++)
@@ -748,24 +766,26 @@ static float tscale=1, actT, mouseAcc;
 static float rollT,rollCD,rollDX,rollDZ;    /* dodge roll: timer + direction  */
 static float kvx,kvz;                       /* wall-kick horizontal impulse   */
 static float pmoveb;                        /* idle<->run blend for the avatar*/
+static float avYaw;                         /* smoothed avatar facing (rad)   */
 static float camDist=4.05f,camYs=-1.0f;     /* smoothed camera boom + height  */
 
 static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_eye(void){ return py + (rollT>0 ? 0.55f : 1.52f); }
 static float player_camh(void){ return py + (rollT>0 ? 1.45f : 1.92f); }
-static float fireCD,swingT,swingCD,dmgFlash,stepT,shake,bobT,winT,deadT,gtime,wtime,msgT;
+static float fireCD,swingT,swingCD,dmgFlash,stepT,shake,bobT,winT,gtime,wtime,msgT;
 static unsigned gseed=0;                    /* xor'd into the level seed      */
 static int smoke=0;
 
 static void reset_game(void){
   gen_level(curlevel,gseed);
   px=startx; pz=startz; pyaw=startyaw; ppitch=0; pvx=pvz=pvy=0;
+  avYaw=startyaw*PI/180.0f;
   py=hgt[(int)(startz/CELL)][(int)(startx/CELL)];
   php=100; pammo=6; haspistol=1; jumps=1;
   tscale=1; actT=0; mouseAcc=0;
   rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=0;
   camDist=4.05f; camYs=-1.0f;
-  fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=deadT=wtime=0;
+  fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=wtime=0;
   msgT=3.0f;
   for(int i=0;i<MAXTEMPL;i++)templ_[i].life=0;
   for(int i=0;i<MAXPART;i++)parts[i].life=0;
@@ -779,10 +799,7 @@ static int circ_free(float x,float z,float r,float y){
   for(int dz=-1;dz<=1;dz++)for(int dx=-1;dx<=1;dx++){
     int cx=(int)floorf(x/CELL)+dx, cz=(int)floorf(z/CELL)+dz;
     if(cellh(cx,cz)<=y+STEP)continue;
-    float bx0=cx*CELL,bx1=bx0+CELL,bz0=cz*CELL,bz1=bz0+CELL;
-    float nx=x<bx0?bx0:(x>bx1?bx1:x), nz=z<bz0?bz0:(z>bz1?bz1:z);
-    float ddx=x-nx,ddz=z-nz;
-    if(ddx*ddx+ddz*ddz < r*r) return 0;
+    if(circ_cell(x,z,r,cx,cz)) return 0;
   }
   return 1;
 }
@@ -792,16 +809,13 @@ static void move_circ(float*x,float*z,float dx,float dz,float r,float y){
 }
 /* the floor under a standing circle: highest reachable cell top it overlaps */
 static float ground_h(float x,float z,float y){
-  float g=0, r=0.30f;
+  float g=0;
   for(int dz=-1;dz<=1;dz++)for(int dx=-1;dx<=1;dx++){
     int cx=(int)floorf(x/CELL)+dx, cz=(int)floorf(z/CELL)+dz;
     if(cx<0||cz<0||cx>=G||cz>=G||grid[cz][cx])continue;
     float h=hgt[cz][cx];
     if(h>y+STEP||h<=g)continue;
-    float bx0=cx*CELL,bx1=bx0+CELL,bz0=cz*CELL,bz1=bz0+CELL;
-    float nx=x<bx0?bx0:(x>bx1?bx1:x), nz=z<bz0?bz0:(z>bz1?bz1:z);
-    float ddx=x-nx,ddz=z-nz;
-    if(ddx*ddx+ddz*ddz < r*r) g=h;
+    if(circ_cell(x,z,0.30f,cx,cz)) g=h;
   }
   return g;
 }
@@ -867,7 +881,7 @@ static void dopp_rgb(float vr,float*r,float*g,float*b){
 static void hurt_player(float dmg){
   if(gstate!=ST_PLAY)return;
   php-=dmg; dmgFlash=0.6f; shake=0.3f; sfx(V_HURT);
-  if(php<=0){ php=0; gstate=ST_DEAD; deadT=0; SDL_SetRelativeMouseMode(SDL_FALSE); }
+  if(php<=0){ php=0; gstate=ST_DEAD; SDL_SetRelativeMouseMode(SDL_FALSE); }
 }
 static Bullet* new_bullet(void){
   for(int i=0;i<MAXBUL;i++) if(!bul[i].on){
@@ -1117,7 +1131,31 @@ static void set_uM(const float*m,float tx,float ty,float tz){
     glUniformMatrix3fv(uM3,1,GL_FALSE,f); glUniform3f(uT,tx,-ty,tz); }
   else { glUniformMatrix3fv(uM3,1,GL_FALSE,m); glUniform3f(uT,tx,ty,tz); }
 }
+/* display-list cache: the humanoids redraw the same handful of fixed shapes
+ * hundreds of times a frame; bake each unique signature once and replay it.
+ * Armed only inside the figure draws — shards/items have randomized sizes
+ * that would churn the cache. Returns 0 emit, 1 replayed, 2 emit-and-record. */
+static int primArm=0;
+#define MAXPRIM 96
+static struct { float p[3]; int seg,ring,type; GLuint l; } primc[MAXPRIM];
+static int nprim;
+static int prim_open(int type,float a,float b,float c,int seg,int ring){
+  if(!primArm)return 0;
+  for(int i=0;i<nprim;i++)
+    if(primc[i].type==type&&primc[i].seg==seg&&primc[i].ring==ring
+       &&primc[i].p[0]==a&&primc[i].p[1]==b&&primc[i].p[2]==c){
+      glCallList(primc[i].l); return 1; }
+  if(nprim>=MAXPRIM)return 0;
+  GLuint l=glGenLists(1); if(!l)return 0;
+  primc[nprim].type=type; primc[nprim].seg=seg; primc[nprim].ring=ring;
+  primc[nprim].p[0]=a; primc[nprim].p[1]=b; primc[nprim].p[2]=c;
+  primc[nprim].l=l; nprim++;
+  glNewList(l,GL_COMPILE_AND_EXECUTE);
+  return 2;
+}
+
 static void box_sh(float sx,float sy,float sz){ /* shader-lit box, centred */
+  int pc=prim_open(0,sx,sy,sz,0,0); if(pc==1)return;
   float x=sx*0.5f,y=sy*0.5f,z=sz*0.5f;
   glBegin(GL_QUADS);
   glNormal3f(0,0,1);  glTexCoord2f(0.5f,0.5f);
@@ -1133,11 +1171,13 @@ static void box_sh(float sx,float sy,float sz){ /* shader-lit box, centred */
   glNormal3f(0,-1,0);
   glVertex3f(-x,-y,-z); glVertex3f(x,-y,-z); glVertex3f(x,-y,z); glVertex3f(-x,-y,z);
   glEnd();
+  if(pc==2)glEndList();
 }
 /* shader-lit tapered cylinder along local Y, centred. r0=bottom r1=top radius,
  * seg sides. ONE normal per facet (SUPERHOT cut): limbs read as crystal prisms,
  * each plane catching its own band of light. */
 static void cyl_sh(float r0,float r1,float h,int seg){
+  int pc=prim_open(1,r0,r1,h,seg,0); if(pc==1)return;
   float y0=-h*0.5f,y1=h*0.5f,dr=r1-r0;
   float nl=sqrtf(h*h+dr*dr); if(nl<1e-6f)nl=1;
   glBegin(GL_TRIANGLES); glTexCoord2f(0.5f,0.5f);
@@ -1155,6 +1195,7 @@ static void cyl_sh(float r0,float r1,float h,int seg){
       glVertex3f(0,y1,0); glVertex3f(tx0,y1,tz0); glVertex3f(tx1,y1,tz1); }
   }
   glEnd();
+  if(pc==2)glEndList();
 }
 /* one ellipsoid position (normal is emitted per patch, not per vertex) */
 static void spos(float rx,float ry,float rz,float ph,float th){
@@ -1163,6 +1204,7 @@ static void spos(float rx,float ry,float rz,float ph,float th){
 /* shader-lit faceted ellipsoid, centred. One analytic normal per patch,
  * evaluated at the patch centre — at low seg/ring it reads as a cut gem. */
 static void sphere_sh(float rx,float ry,float rz,int seg,int ring){
+  int pc=prim_open(2,rx,ry,rz,seg,ring); if(pc==1)return;
   glBegin(GL_TRIANGLES); glTexCoord2f(0.5f,0.5f);
   for(int j=0;j<ring;j++){
     float p0=PI*j/ring-PI*0.5f, p1=PI*(j+1)/ring-PI*0.5f, pm=(p0+p1)*0.5f;
@@ -1177,6 +1219,7 @@ static void sphere_sh(float rx,float ry,float rz,int seg,int ring){
     }
   }
   glEnd();
+  if(pc==2)glEndList();
 }
 
 /* the agents: SUPERHOT-cut crystal humanoids in dark suits, emerald eyes.
@@ -1184,6 +1227,7 @@ static void sphere_sh(float rx,float ry,float rz,int seg,int ring){
  * charcoal mixed with the Doppler shade of their motion. */
 static void draw_agent(Enemy*e,float dim){
   if(e->state==4)return;
+  primArm=1;
   float M[9],R[9],X[9];
   float by=e->y;
   float walk = sinf(e->anim), walk2=sinf(e->anim+PI);
@@ -1293,23 +1337,26 @@ static void draw_agent(Enemy*e,float dim){
   }
 
   glUniform1f(uEmis,0);
+  primArm=0;
 }
 
 /* third-person player avatar: compact, sleek, low-poly and readable from
  * behind. The whole figure hangs off a mid-body pivot so the dodge roll can
  * somersault it; the camera never rolls with it. */
 static void draw_player(void){
+  primArm=1;
   float M[9],R[9],X[9];
   int rolling = rollT>0;
   float rp = rolling? sstep(1.0f-rollT/0.42f) : 0;     /* roll progress 0..1 */
+  float tuck = rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
+  float tk = 1.0f-0.50f*tuck;                          /* anchors pull in    */
   float walk = sinf(bobT*7.5f), walk2 = sinf(bobT*7.5f+PI);
-  float yawr = rolling? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f;
   float lean = rolling? rp*2*PI : 0.10f*pmoveb;        /* full forward flip  */
-  m3rotY(R,yawr); m3rotX(X,lean); m3mul(M,R,X);
-  float pcy=py+0.55f;                                  /* the body pivot     */
+  m3rotY(R,avYaw); m3rotX(X,lean); m3mul(M,R,X);
+  float pcy=py+0.55f+0.25f*tuck;     /* pivot lifts so the ball clears floor */
 
   float s = swingT>0? clampf(swingT/0.26f,0,1) : 0;    /* katana swing phase */
-  int blade = s>0 || swingCD>0.24f;                    /* + follow-through   */
+  int blade = s>0 || swingCD>0;                        /* + follow-through   */
 
   glUniform1f(uBump,0);
   glUniform1f(uGloss,0.55f);
@@ -1321,7 +1368,7 @@ static void draw_player(void){
     float side=li?0.14f:-0.14f;
     float sw = rolling? 1.0f : (li?walk:walk2)*0.42f*pmoveb;
     float kb = rolling? 1.5f : 0.12f+0.30f*clampf(0.5f-0.5f*(li?walk:walk2),0,1)*pmoveb;
-    float hip[3]; m3v(M,side,0.37f,0,hip);
+    float hip[3]; m3v(M,side,0.37f*tk,0,hip);
     float hx=px+hip[0], hy=pcy+hip[1], hz=pz+hip[2];
     float UL[9],RX[9]; m3rotX(RX,sw); m3mul(UL,M,RX);
     float ulc[3]; m3v(UL,0,-0.22f,0,ulc);
@@ -1339,25 +1386,26 @@ static void draw_player(void){
   float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.62f);
   glUniform3f(uTint,0.03f,0.04f,0.035f);
   { float o[3];
-    m3v(M,0,0.49f,0,o);  set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.175f,0.155f,0.24f,7);
-    m3v(M,0,0.87f,0,o);  set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,7); }
+    m3v(M,0,0.49f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.175f,0.155f,0.24f,7);
+    m3v(M,0,0.87f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,7); }
   glUniform3f(uTint,0.05f,0.06f,0.055f);
-  for(int si=-1;si<=1;si+=2){ float so[3]; m3v(M,si*0.27f,1.05f,0,so);
+  for(int si=-1;si<=1;si+=2){ float so[3]; m3v(M,si*0.27f,1.05f*tk,0,so);
     set_uM(M,px+so[0],pcy+so[1],pz+so[2]); sphere_sh(0.08f,0.08f,0.08f,6,4); }
 
   /* shoulders and arms. right arm: pistol raise on fire, katana sweep on
    * swing — wind-up across the left shoulder, cut down and across. */
   glUniform3f(uTint,0.04f,0.05f,0.045f);
   for(int ai=0;ai<2;ai++){
-    float fr=clampf(fireCD/0.34f,0,1);
     float raise, swYaw=0;
     if(ai){
+      float fr=clampf(fireCD/0.34f,0,1);
       raise = haspistol&&fr>0 ? (0.85f+0.50f*sstep(fr)) : 0.12f;
       if(s>0){ raise = 0.5f+0.9f*sinf(s*PI); swYaw = 0.9f-2.0f*sstep(s); }
       else if(blade) raise=0.35f;
-    } else raise = rolling? 1.2f : 0.0f;
+    } else raise = 0.0f;
+    if(rolling){ raise=1.2f; swYaw=0; }    /* both arms hug the tucked knees */
     float sw = rolling? 1.0f : (ai?walk2:walk)*0.32f*pmoveb*clampf(1.0f-raise*2.0f,0,1);
-    float sh[3]; m3v(M,ai?0.27f:-0.27f,1.05f,0,sh);
+    float sh[3]; m3v(M,ai?0.27f:-0.27f,1.05f*tk,0,sh);
     float shx=px+sh[0], shy=pcy+sh[1], shz=pz+sh[2];
     float A[9],RX[9],RY[9],S[9];
     m3rotX(RX,-raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,M,S);
@@ -1398,22 +1446,21 @@ static void draw_player(void){
   /* neck / head */
   glUniform3f(uTint,0.06f,0.07f,0.065f);
   { float o[3];
-    m3v(M,0,1.10f,0,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.052f,0.062f,0.13f,6);
-    m3v(M,0,1.29f,0,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); sphere_sh(0.125f,0.155f,0.135f,6,4);
+    m3v(M,0,1.10f*tk,0,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.052f,0.062f,0.13f,6);
+    m3v(M,0,1.29f*tk,0,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); sphere_sh(0.125f,0.155f,0.135f,6,4);
     /* slim collar and sunglasses band for the Matrix feel */
     glUniform3f(uTint,0.02f,0.02f,0.02f);
-    m3v(M,0,1.18f,-0.04f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.18f,0.045f,0.16f);
-    m3v(M,0,1.30f,-0.02f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.20f,0.045f,0.12f); }
+    m3v(M,0,1.18f*tk,-0.04f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.18f,0.045f,0.16f);
+    m3v(M,0,1.30f*tk,-0.02f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.20f,0.045f,0.12f); }
   glUniform1f(uEmis,0.0f);
+  primArm=0;
 }
 
 static void draw_items(void){
   float M[9];
   for(int i=0;i<nitems;i++){
     if(items[i].taken)continue;
-    float gy=cellh((int)floorf(items[i].x/CELL),(int)floorf(items[i].z/CELL));
-    if(gy>100.0f)gy=0;
-    float bob=gy+0.45f+0.1f*sinf(wtime*2.5f+i);
+    float bob=floor_at(items[i].x,items[i].z)+0.45f+0.1f*sinf(wtime*2.5f+i);
     m3rotY(M,wtime*1.5f+i);
     glUniform1f(uEmis,1); glUniform1f(uBump,0); glUniform1f(uGloss,0.4f);
     if(items[i].type==0){ /* health: white cross-ish twin cubes */
@@ -1633,7 +1680,11 @@ static void draw_world(float camx,float camy,float camz){
   glDisableClientState(GL_TEXTURE_COORD_ARRAY);
 
   glActiveTexture_(GL_TEXTURE0);
-  for(int i=0;i<nen;i++) draw_agent(&en[i],1.0f);
+  for(int i=0;i<nen;i++){       /* beyond ~36u the fog has swallowed them */
+    float ddx=en[i].x-camx, ddz=en[i].z-camz;
+    if(ddx*ddx+ddz*ddz>38.0f*38.0f)continue;
+    draw_agent(&en[i],1.0f);
+  }
   if(gstate==ST_PLAY) draw_player();
   draw_items();
   draw_shards();
@@ -1833,6 +1884,15 @@ static void shot_ppm(const char*path){
   free(buf);
 }
 
+/* WASD -> world-space move direction, relative to the view yaw */
+static void wasd_dir(int w,int s,int a,int d,float*mx,float*mz){
+  float yr=pyaw*PI/180;
+  float fx=sinf(yr),fz=-cosf(yr),rx=cosf(yr),rz=sinf(yr);
+  *mx=0;*mz=0;
+  if(w){*mx+=fx;*mz+=fz;} if(s){*mx-=fx;*mz-=fz;}
+  if(d){*mx+=rx;*mz+=rz;} if(a){*mx-=rx;*mz-=rz;}
+}
+
 /* ---------------------------------------------------------------- main */
 int main(int argc,char**argv){
   unsigned t0;
@@ -1920,12 +1980,11 @@ int main(int argc,char**argv){
             if(d&&gstate==ST_PLAY&&rollCD<=0&&rollT<=0
                &&py<=ground_h(px,pz,py)+0.05f){
               /* dodge roll along current input, or straight ahead */
-              float yr2=pyaw*PI/180;
-              float mx=0,mz=0;
-              if(wdown){mx+=sinf(yr2);mz-=cosf(yr2);} if(sdown){mx-=sinf(yr2);mz+=cosf(yr2);}
-              if(ddown){mx+=cosf(yr2);mz+=sinf(yr2);} if(adown){mx-=cosf(yr2);mz-=sinf(yr2);}
+              float mx,mz;
+              wasd_dir(wdown,sdown,adown,ddown,&mx,&mz);
               float ml2=sqrtf(mx*mx+mz*mz);
-              if(ml2<0.01f){ mx=sinf(yr2); mz=-cosf(yr2); ml2=1; }
+              if(ml2<0.01f){ float yr2=pyaw*PI/180;
+                mx=sinf(yr2); mz=-cosf(yr2); ml2=1; }
               rollDX=mx/ml2; rollDZ=mz/ml2;
               rollT=0.42f; rollCD=0.75f; actT=0.42f;
               sfxp(V_SWING,0.7f);
@@ -2010,11 +2069,8 @@ int main(int argc,char**argv){
      * sink to the MINTS creep. the player always moves in real time. */
     float wdt=dt;
     if(gstate==ST_PLAY){
-      float yr=pyaw*PI/180;
-      float fx=sinf(yr),fz=-cosf(yr), rx=cosf(yr),rz=sinf(yr);
-      float mx=0,mz=0;
-      if(wdown){mx+=fx;mz+=fz;} if(sdown){mx-=fx;mz-=fz;}
-      if(ddown){mx+=rx;mz+=rz;} if(adown){mx-=rx;mz-=rz;}
+      float mx,mz;
+      wasd_dir(wdown,sdown,adown,ddown,&mx,&mz);
       float ml=sqrtf(mx*mx+mz*mz);
       float ox=px,oz=pz;
       if(rollT>0){                 /* the roll owns the legs while it runs */
@@ -2034,6 +2090,9 @@ int main(int argc,char**argv){
       pvx=(px-ox)/dt; pvz=(pz-oz)/dt;
       pmoveb=toward(pmoveb,(ml>0.01f||rollT>0)?1.0f:0.0f,dt*9.0f);
       bobT+=dt*(0.15f+0.85f*pmoveb);   /* stride phase never freezes mid-step */
+      /* the avatar's facing eases toward the roll direction and back —
+       * no yaw snap entering or leaving a sideways roll */
+      avYaw=angto(avYaw, rollT>0? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f, dt*14.0f);
 
       pvy-=18.0f*dt;
       py += pvy*dt;
@@ -2071,16 +2130,14 @@ int main(int argc,char**argv){
       for(int i=0;i<nitems;i++){
         if(items[i].taken)continue;
         float dx=items[i].x-px,dz=items[i].z-pz;
-        float gy=cellh((int)floorf(items[i].x/CELL),(int)floorf(items[i].z/CELL));
-        if(gy>100.0f)gy=0;
-        if(dx*dx+dz*dz<0.8f*0.8f && fabsf(gy-py)<1.4f){
+        if(dx*dx+dz*dz<0.8f*0.8f && fabsf(floor_at(items[i].x,items[i].z)-py)<1.4f){
           items[i].taken=1; sfx(V_PICK);
           if(items[i].type==0){ php+=35; if(php>100)php=100; }
           else { haspistol=1; pammo+=items[i].amt; if(pammo>18)pammo=18; }
         }
       }
     }
-    if(gstate==ST_DEAD){ deadT+=dt; wdt=dt*MINTS; wtime+=wdt; update_bullets(wdt); }
+    if(gstate==ST_DEAD){ wdt=dt*MINTS; wtime+=wdt; update_bullets(wdt); }
     if(gstate==ST_WIN){ wdt=dt*0.25f; wtime+=wdt; update_bullets(wdt); }  /* victory slow-mo */
     g_ats = gstate==ST_PLAY ? tscale : (gstate==ST_TITLE?1.0f:0.3f);
 
@@ -2088,8 +2145,7 @@ int main(int argc,char**argv){
       Part*p=&parts[i]; if(p->life<=0)continue;
       p->life-=wdt; p->vy-=6.0f*wdt;
       p->x+=p->vx*wdt; p->y+=p->vy*wdt; p->z+=p->vz*wdt;
-      float pg=cellh((int)floorf(p->x/CELL),(int)floorf(p->z/CELL));
-      if(pg>100.0f)pg=0;
+      float pg=floor_at(p->x,p->z);
       if(p->y<pg+0.02f){p->y=pg+0.02f;p->vy*=-0.3f;p->vx*=0.7f;p->vz*=0.7f;}
     }
     for(int i=0;i<MAXSHARD;i++){
@@ -2097,8 +2153,7 @@ int main(int argc,char**argv){
       s->life-=wdt; s->vy-=7.0f*wdt;
       s->x+=s->vx*wdt; s->y+=s->vy*wdt; s->z+=s->vz*wdt;
       s->yaw+=s->wy*wdt; s->pit+=s->wp*wdt;
-      float sg=cellh((int)floorf(s->x/CELL),(int)floorf(s->z/CELL));
-      if(sg>100.0f)sg=0;
+      float sg=floor_at(s->x,s->z);
       if(s->y<sg+s->sy*0.5f){ s->y=sg+s->sy*0.5f; s->vy*=-0.35f; s->vx*=0.6f; s->vz*=0.6f;
         s->wy*=0.5f; s->wp*=0.5f; }
     }
@@ -2123,11 +2178,11 @@ int main(int argc,char**argv){
     if(camYs<0)camYs=pivy;
     camYs=toward(camYs,pivy,dt*10.0f);
     float ox2=-fx*4.05f+rx*0.70f, oz2=-fz*4.05f+rz*0.70f;
-    float want=sqrtf(ox2*ox2+oz2*oz2);
-    float ux=ox2/want, uz=oz2/want;
-    float hit=ray_wall(px,camYs,pz,ux,0,uz,want+0.30f);
+    float boom=sqrtf(ox2*ox2+oz2*oz2);
+    float ux=ox2/boom, uz=oz2/boom;
+    float hit=ray_wall(px,camYs,pz,ux,0,uz,boom+0.30f);
     float maxd=hit-0.28f; if(maxd<0.40f)maxd=0.40f;
-    float tgt=want<maxd?want:maxd;
+    float tgt=boom<maxd?boom:maxd;
     if(tgt<camDist)camDist=tgt; else camDist=toward(camDist,tgt,dt*5.0f);
     float camx=px+ux*camDist;
     float camz=pz+uz*camDist;
