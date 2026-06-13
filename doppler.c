@@ -1307,6 +1307,9 @@ static void katana_strike(void){
     float il=1.0f/sqrtf(ndx*ndx+ndy*ndy+ndz*ndz+1e-9f);
     b->vx=ndx*il*19.0f; b->vy=ndy*il*19.0f; b->vz=ndz*il*19.0f;
     b->owner=1; b->life=6.0f;
+    /* a clean deflection is also a free round: bat the bullet back AND pocket
+     * the brass — rewards aggressive katana play, capped like any pickup */
+    if(haspistol&&pammo<PLAYER_MAX_AMMO)pammo++;
     spawn_parts(6,b->x,b->y,b->z,2.0f, 0.4f,1.2f,1.8f);
     add_templ(b->x,b->y,b->z,4.0f,0.12f, 0.8f,2.4f,2.6f);
     sfx3(V_DEFLECT,0.9f+frand()*0.25f,b->x,b->y,b->z);
@@ -3029,7 +3032,57 @@ int main(int argc,char**argv){
       if(frame==106)shot_ppm("shot_shatter.ppm");
       if(frame==112)katana();
       if(frame==118)shot_ppm("shot_katana_pose.ppm");
-      if(frame>=142){ printf("[doppler] SMOKE OK\n"); running=0; }
+
+      /* Extended choreography: the pistol's charge gauge, a charged lock-on,
+       * and a dodge roll. All staged strictly AFTER the six baseline shots
+       * (frame<=118) so their frand() order and bytes stay untouched and the
+       * regression gate against baseline/ remains byte-identical. */
+      static float smkYaw=0;
+      if(frame==122){                 /* fresh stage facing the longest open corridor */
+        reset_game(); gstate=ST_PLAY; nen=nalive=0;
+        float best=0,besta=0;
+        for(int k=0;k<64;k++){ float a=k*2*PI/64;
+          float d=ray_wall(px,EYE,pz,sinf(a),0,-cosf(a),40);
+          if(d>best){best=d;besta=a;} }
+        smkYaw=besta*180/PI;
+      }
+      /* CHARGE: a half-filled green beam grows down the empty corridor — the
+       * range gauge filling from motion, no agent in reach yet. */
+      if(frame>=122&&frame<130){ pyaw=smkYaw; ppitch=3; gunCharge=0.60f; }
+      if(frame==129)shot_ppm("shot_charge.ppm");
+      /* LOCK-ON: stage an agent in that corridor and fully charge — the beam
+       * reaches it and both the beam and the agent flare red (locked). */
+      if(frame==130){
+        float yr=smkYaw*PI/180;
+        float ex=px+sinf(yr)*7.0f, ez=pz-cosf(yr)*7.0f;
+        nen=nalive=1; memset(&en[0],0,sizeof en[0]);
+        en[0].type=0; en[0].hue=0.30f;
+        en[0].x=en[0].lx=ex; en[0].z=en[0].lz=ez; en[0].y=ground_h(ex,ez,py);
+      }
+      if(frame>=130&&frame<138){      /* hold the agent mid-aim and the lock steady */
+        float dx=en[0].x-px, dz=en[0].z-pz, d=sqrtf(dx*dx+dz*dz);
+        float muzY=py+1.52f, aimY=en[0].y+1.30f;
+        pyaw=atan2f(dx,-dz)*180/PI;
+        ppitch=atan2f(muzY-aimY,d)*180/PI;
+        en[0].state=1; en[0].state_t=0; en[0].flash=0;
+        gunCharge=1.0f;
+      }
+      if(frame==137)shot_ppm("shot_lockon.ppm");
+      /* DODGE ROLL: the agent's round streaks down the old sightline; the
+       * player rolls sideways so the bullet passes through the vacated spot. */
+      if(frame==138){
+        float yr=pyaw*PI/180;
+        rollT=0.5f; rollCD=0.6f;
+        rollDX=cosf(yr); rollDZ=sinf(yr);             /* strafe-right dodge      */
+        float dx=px-en[0].x, dz=pz-en[0].z, dd=sqrtf(dx*dx+dz*dz)+1e-6f;
+        float bdx=dx/dd, bdz=dz/dd;                    /* agent -> player          */
+        float my=en[0].y+1.36f, ty=py+1.28f;
+        float bx=px-bdx*0.8f, bz=pz-bdz*0.8f;          /* timed to arrive beside   */
+        spawn_bullet(bx,my,bz,bdx,ty-my,bdz,8.0f,0,0,0,-1);
+      }
+      if(frame>=138&&frame<146)ppitch=4;
+      if(frame==144)shot_ppm("shot_dodge.ppm");
+      if(frame>=150){ printf("[doppler] SMOKE OK\n"); running=0; }
     }
 
     if(gstate==ST_TITLE){ titleYaw+=dt*7; pyaw=titleYaw; ppitch=4;
