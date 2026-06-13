@@ -11,13 +11,13 @@ SDL2, the whole game is one `.c` file and compiles to under ~150Kb.
 
 ## Features
 
-| Section | Features | Image |
-| --- | --- | --- |
-| **Locomotion** | Run, dodge, double-jump or wall-kick your way around enemies and incoming fire. | ![Run](screenshots/shot_run_pose.png) |
-| **Pistol** | The laser pointer indicates where you're aiming but also charges as you move and dictates the distance you can shoot. Enemies will be highlighted when within range. | ![Lock-on](screenshots/shot_lockon.png) |
-| **Katana** | Deflect incoming bullets with your katana or take out enemies at close range. | ![Katana](screenshots/shot_katana_pose.png) |
-| **Dodge roll** | `SHIFT` / `CTRL` / `C` rolls you sideways evading enemy fire | ![Dodge roll](screenshots/shot_dodge.png) |
-| **Shatter** | Defeating enemies sometimes leaves behind health packs or ammo. | ![Shatter](screenshots/shot_shatter.png) |
+| Features | Image |
+| --- | --- |
+| **Locomotion** - Run, dodge, double-jump or wall-kick your way around enemies and incoming fire. | ![Run](screenshots/shot_run_pose.png) |
+| **Pistol** - The laser pointer indicates where you're aiming but also charges as you move and dictates the distance you can shoot. Enemies will be highlighted when within range. | ![Lock-on](screenshots/shot_lockon.png) |
+| **Katana** - Deflect incoming bullets with your katana or take out enemies at close range. | ![Katana](screenshots/shot_katana_pose.png) |
+| **Dodge roll** - `SHIFT` / `CTRL` / `C` rolls you sideways evading enemy fire | ![Dodge roll](screenshots/shot_dodge.png) |
+| **Shatter** - Defeating enemies sometimes leaves behind health packs or ammo. | ![Shatter](screenshots/shot_shatter.png) |
 
 
 ## Build & run
