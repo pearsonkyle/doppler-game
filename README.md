@@ -7,7 +7,7 @@ no assets on disk, no engine. Every texture, level, mesh, sound, and font is
 synthesized at startup or runtime. Stripped down to immediate-mode OpenGL 2 and
 SDL2, the whole game is one `.c` file and compiles to under ~150Kb.
 
-![Title screen](screenshots/shot_title.png)
+![Title screen](screenshots/title.gif)
 
 | Features | Image |
 | --- | --- |

@@ -1047,6 +1047,7 @@ static float gunCharge;                       /* 0..1, controls laser/shot range
 static int laserTarget=-1;                    /* living enemy currently reachable by charged beam */
 static unsigned gseed=0;                    /* xor'd into the level seed      */
 static int smoke=0;
+static int titlecap=0;   /* --titlecap: dump a numbered title-screen frame sequence for the README GIF */
 
 static void reset_game(void){
   gen_level(curlevel,gseed);
@@ -2863,13 +2864,14 @@ int main(int argc,char**argv){
   unsigned t0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--smoke"))smoke=1;
+    else if(!strcmp(argv[i],"--titlecap"))titlecap=1;
     else if(!strcmp(argv[i],"--seed")&&i+1<argc)gseed=(unsigned)strtoul(argv[++i],0,0);
     else if(!strcmp(argv[i],"--level")&&i+1<argc){
       long l=strtol(argv[++i],0,0);
       curlevel=(int)(l<0?0:l>=NLEVEL?NLEVEL-1:l);
     }
   }
-  if(smoke) SDL_setenv("SDL_AUDIODRIVER","dummy",1);
+  if(smoke||titlecap) SDL_setenv("SDL_AUDIODRIVER","dummy",1);
 
   if(SDL_Init(SDL_INIT_VIDEO)<0){ fprintf(stderr,"SDL: %s\n",SDL_GetError()); return 1; }
   SDL_InitSubSystem(SDL_INIT_AUDIO);
@@ -2879,7 +2881,7 @@ int main(int argc,char**argv){
     WINW,WINH,SDL_WINDOW_OPENGL);
   SDL_GLContext ctx=SDL_GL_CreateContext(win);
   if(!ctx){ fprintf(stderr,"GL: %s\n",SDL_GetError()); return 1; }
-  SDL_GL_SetSwapInterval(smoke?0:1);
+  SDL_GL_SetSwapInterval(smoke||titlecap?0:1);
   load_gl();
   printf("[doppler] GL: %s / %s\n",glGetString(GL_RENDERER),glGetString(GL_VERSION));
 
@@ -2984,10 +2986,23 @@ int main(int argc,char**argv){
     }
 
     unsigned now=SDL_GetTicks();
-    float dt=smoke?1.0f/60:(now-last)/1000.0f;
+    float dt=(smoke||titlecap)?1.0f/60:(now-last)/1000.0f;
     last=now;
     if(dt>0.05f)dt=0.05f;
     gtime+=dt;
+
+    /* title capture: hold the title screen and dump a numbered frame sequence
+     * (every 3rd internal frame -> 20fps source) for the README GIF. A short
+     * warmup skips the undefined first back-buffer. */
+    if(titlecap){
+      gstate=ST_TITLE;
+      if(frame>=6 && frame%3==0){
+        char nm[64]; snprintf(nm,sizeof nm,"titlecap_%04d.ppm",(frame-6)/3);
+        shot_ppm(nm);
+      }
+      frame++;
+      if(frame>=366){ printf("[doppler] TITLECAP wrote %d frames\n",(frame-6)/3); running=0; }
+    }
 
     /* smoke choreography: gen-check done above; now title shot, jack in,
      * stage an agent, trade fire, shatter it, screenshot the lot. */
