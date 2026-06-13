@@ -2,3 +2,5 @@ doppler
 *.ppm
 *.png
 *.o
+!screenshots/
+!screenshots/*.png
