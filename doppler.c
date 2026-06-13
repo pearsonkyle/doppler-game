@@ -15,7 +15,7 @@
  *
  * Agents are faceted low-poly humanoids with emerald eyes. One hit shatters
  * them into glowing polygon shards. RMB swings a katana that deflects bullets
- * back at the nearest agent; F throws your pistol. Clear all agents to win.
+ * back at the nearest agent. Clear all agents to win.
  *
  * Movement: SPACE jumps (twice — once more in the air), kicking off a wall
  * mid-air rebounds you upward, SHIFT/CTRL dodge-rolls under fire. Sectors are
@@ -86,6 +86,11 @@ static void load_gl(void){
 #define MINTS 0.045f      /* simulation never fully stops (SUPERHOT creep) */
 #define NLEVEL 3
 #define STEP 0.55f        /* max auto step-up: anything taller is a wall */
+#define GUN_MAX_RANGE 42.0f
+#define GUN_CHARGE_TIME 3.85f
+#define GUN_IDLE_CHARGE 0.03f  /* tiny capacitor leak; movement does the work */
+#define PLAYER_MAX_AMMO 18
+#define PLAYER_BULLET_SPEED 21.5f
 static float wallh=3.4f;  /* hall height, set per sector */
 
 /* ---------------------------------------------------------------- rng/noise */
@@ -142,6 +147,19 @@ static void m3scl(float*m,float x,float y,float z){
   m[0]*=x;m[1]*=x;m[2]*=x; m[3]*=y;m[4]*=y;m[5]*=y; m[6]*=z;m[7]*=z;m[8]*=z; }
 static void m3v(const float*m,float x,float y,float z,float*o){
   o[0]=m[0]*x+m[3]*y+m[6]*z; o[1]=m[1]*x+m[4]*y+m[7]*z; o[2]=m[2]*x+m[5]*y+m[8]*z; }
+/* Build a stable weapon basis: local -Z is the barrel / aim direction. */
+static void m3aim(float*m,float dx,float dy,float dz){
+  float il=1.0f/sqrtf(dx*dx+dy*dy+dz*dz+1e-9f);
+  dx*=il; dy*=il; dz*=il;
+  float zx=-dx,zy=-dy,zz=-dz;                 /* local +Z points back at us */
+  float xx=zz,xz=-zx, xl=sqrtf(xx*xx+xz*xz); /* world-up cross Z */
+  if(xl<1e-4f){ xx=1; xz=0; xl=1; }
+  xx/=xl; xz/=xl;
+  float yx=zy*xz-zz*0.0f, yy=zz*xx-zx*xz, yz=zx*0.0f-zy*xx;
+  m[0]=xx; m[1]=0;  m[2]=xz;
+  m[3]=yx; m[4]=yy; m[5]=yz;
+  m[6]=zx; m[7]=zy; m[8]=zz;
+}
 
 /* ---------------------------------------------------------------- textures
  * The construct is black-on-black: dark panel walls (the digital rain is
@@ -318,9 +336,10 @@ typedef struct {
 static Enemy en[MAXENEMY]; static int nen, nalive;
 
 /* bullets: the slow, visible, deflectable kind. owner 0=enemy 1=player.
- * kind 0=round 1=thrown pistol. trail is a ring buffer of past positions. */
+ * range>=0 means the round expires after that much travel. trail is a ring
+ * buffer of past positions. */
 typedef struct {
-  float x,y,z,vx,vy,vz,life,spin;
+  float x,y,z,vx,vy,vz,life,spin,range;
   int on,owner,kind,amt;
   float tr[TRAILN][3]; int tn,th; float trd;
 } Bullet;
@@ -550,7 +569,7 @@ static void gen_level(int li,unsigned seedmix){
  * read by the audio callback — a word-sized store, same lock-free style the
  * original used for voices[]. */
 enum { V_SHOT, V_ESHOT, V_DEFLECT, V_SWING, V_SHATTER, V_HURT,
-       V_PICK, V_STEP, V_CLICK, V_WIN, V_WHOOSH, V_THROW,
+       V_PICK, V_STEP, V_CLICK, V_WIN, V_WHOOSH,
        V_ROLL, V_JUMP, V_KICK, V_LAND };
 typedef struct { int type,on,world; float t,p; } Voice;
 static Voice voices[MAXVOICE];
@@ -624,9 +643,6 @@ static void audio_cb(void*ud,Uint8*stream,int len){
         case V_WHOOSH:{ lps+=(0.5f-0.4f*t)*(arand()-lps);   /* passing bullet */
           s+=lps*0.9f*expf(-t*6)*p;
           if(t>0.5f)voices[v].on=0; }break;
-        case V_THROW:{ lps+=0.15f*(arand()-lps);
-          s+=lps*expf(-t*9)*0.9f + sinf(2*PI*(300-t*500)*t)*expf(-t*8)*0.2f;
-          if(t>0.4f)voices[v].on=0; }break;
         case V_ROLL:{ /* the dodge: a fast cloth-and-air whoosh */
           lps+=(0.08f+0.45f*t)*(arand()-lps);
           float env=1.0f-t*2.5f; if(env<0)env=0;
@@ -779,13 +795,13 @@ enum { ST_TITLE, ST_PLAY, ST_DEAD, ST_WIN };
 static int gstate=ST_TITLE;
 static float px,pz,py,pyaw,ppitch,php;
 static float pvx,pvz,pvy;                   /* player velocity, for Doppler   */
-static int   pammo,haspistol,jumps;         /* jumps = air jumps remaining    */
+static int   pammo,haspistol,jumps;         /* finite pistol ammo; pickups keep you moving */
 static float tscale=1, actT, mouseAcc;
 static float rollT,rollCD,rollDX,rollDZ;    /* dodge roll: timer + direction  */
 static float kvx,kvz;                       /* wall-kick horizontal impulse   */
 static float pmoveb;                        /* idle<->run blend for the avatar*/
 static float avYaw;                         /* smoothed avatar facing (rad)   */
-static float camDist=4.05f,camYs=-1.0f;     /* smoothed camera boom + height  */
+static float camDist=3.05f,camYs=-1.0f;     /* smoothed camera boom + height  */
 static float coyT;                          /* coyote time: late edge jumps   */
 static float hurtCD;                        /* post-hit mercy window          */
 static float mzT,mzX,mzY,mzZ;               /* avatar muzzle flash            */
@@ -794,6 +810,8 @@ static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_eye(void){ return py + (rollT>0 ? 0.55f : 1.52f); }
 static float player_camh(void){ return py + (rollT>0 ? 1.45f : 1.92f); }
 static float fireCD,swingT,swingCD,dmgFlash,stepT,shake,bobT,winT,gtime,wtime,msgT;
+static float gunCharge;                       /* 0..1, controls laser/shot range */
+static int laserTarget=-1;                    /* living enemy currently reachable by charged beam */
 static unsigned gseed=0;                    /* xor'd into the level seed      */
 static int smoke=0;
 
@@ -806,8 +824,9 @@ static void reset_game(void){
   tscale=1; actT=0; mouseAcc=0;
   rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=0;
   coyT=hurtCD=mzT=0;
-  camDist=4.05f; camYs=-1.0f;
+  camDist=3.05f; camYs=-1.0f;
   fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=wtime=0;
+  gunCharge=0;
   msgT=3.0f;
   for(int i=0;i<MAXTEMPL;i++)templ_[i].life=0;
   for(int i=0;i<MAXPART;i++)parts[i].life=0;
@@ -912,12 +931,12 @@ static Bullet* new_bullet(void){
   return 0;
 }
 static void spawn_bullet(float x,float y,float z,float dx,float dy,float dz,
-                         float spd,int owner,int kind,int amt){
+                         float spd,int owner,int kind,int amt,float range){
   Bullet*b=new_bullet(); if(!b)return;
   float il=1.0f/sqrtf(dx*dx+dy*dy+dz*dz+1e-9f);
   b->x=x;b->y=y;b->z=z;
   b->vx=dx*il*spd; b->vy=dy*il*spd; b->vz=dz*il*spd;
-  b->life=6.0f; b->owner=owner; b->kind=kind; b->amt=amt;
+  b->life=6.0f; b->owner=owner; b->kind=kind; b->amt=amt; b->range=range;
   b->tn=0; b->th=0; b->trd=0;
 }
 static void shatter_enemy(Enemy*e){
@@ -937,25 +956,83 @@ static void player_aim(float*dx,float*dy,float*dz){
   float yr=pyaw*PI/180, pr=ppitch*PI/180;
   *dx=sinf(yr)*cosf(pr); *dy=-sinf(pr); *dz=-cosf(yr)*cosf(pr);
 }
+/* Shared authored pose for every player gun cue: hand, pistol, laser, bullets
+ * and muzzle flash all come from this aim basis, not from a separate arm bob. */
+static void player_weapon_pose(float*W,float*gx,float*gy,float*gz,float*mx,float*my,float*mz){
+  float dx,dy,dz; player_aim(&dx,&dy,&dz);
+  m3aim(W,dx,dy,dz);
+  float yr=avYaw;
+  float fx=sinf(yr), fz=-cosf(yr), rx=cosf(yr), rz=sinf(yr);
+  float crouch=rollT>0?0.46f:1.0f;
+  *gx=px+rx*0.32f+fx*0.22f+dx*0.06f;
+  *gy=py+0.74f+0.78f*crouch;
+  *gz=pz+rz*0.32f+fz*0.22f+dz*0.06f;
+  *mx=*gx+dx*0.38f; *my=*gy+dy*0.38f; *mz=*gz+dz*0.38f;
+}
+/* Diegetic aiming: the cursor lives in-world now.  The muzzle is kept near the
+ * avatar's right-hand pistol so the laser/rounds read as coming from the gun,
+ * while direction remains fully controlled by the player's look yaw/pitch. */
+static void player_muzzle(float*ox,float*oy,float*oz){
+  /* Keep the ballistic/laser origin near the authored right hand.  The visible
+   * pistol is attached to the hand transform in draw_player(); this fixed
+   * shoulder-space offset avoids the previous free-floating aim-basis gun. */
+  float yr=avYaw;
+  float fx=sinf(yr), fz=-cosf(yr), rx=cosf(yr), rz=sinf(yr);
+  float crouch=rollT>0?0.46f:1.0f;
+  float dx,dy,dz; player_aim(&dx,&dy,&dz);
+  *ox=px+rx*0.36f+fx*0.34f+dx*0.10f;
+  *oy=py+0.74f+0.78f*crouch+dy*0.10f;
+  *oz=pz+rz*0.36f+fz*0.34f+dz*0.10f;
+}
+static void player_laser(float*mx,float*my,float*mz,float*dx,float*dy,float*dz,
+                         float*hx,float*hy,float*hz,float*dist){
+  player_muzzle(mx,my,mz);
+  player_aim(dx,dy,dz);
+  /* The laser is the capacitor gauge: it grows outward strictly by charge.
+   * Bullets still collide with walls/floors normally; this distance is their
+   * energy budget, not a geometry-clamped crosshair hit. */
+  float d=(haspistol&&pammo>0) ? GUN_MAX_RANGE*clampf(gunCharge,0,1) : 0.0f;
+  *hx=*mx+*dx*d; *hy=*my+*dy*d; *hz=*mz+*dz*d; *dist=d;
+}
+static int laser_target(void){
+  if(gstate!=ST_PLAY||!haspistol||pammo<=0||rollT>0||swingT>0||swingCD>0||gunCharge<=0.001f)return -1;
+  float mx,my,mz,dx,dy,dz,hx,hy,hz,range;
+  player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&range);
+  if(range<0.08f)return -1;
+  float wall=ray_wall(mx,my,mz,dx,dy,dz,range);
+  int best=-1; float bestt=range+1.0f;
+  for(int i=0;i<nen;i++){
+    Enemy*e=&en[i]; if(e->state==4)continue;
+    /* Same readable hit volume as player bullets: a slim vertical capsule.
+     * Test the charged ray against the enemy's horizontal radius, then check
+     * the height at that first intersection. */
+    float ex=mx-e->x, ez=mz-e->z;
+    float a=dx*dx+dz*dz;
+    if(a<1e-6f)continue;
+    float b=2.0f*(ex*dx+ez*dz);
+    float c=ex*ex+ez*ez-0.45f*0.45f;
+    float disc=b*b-4.0f*a*c;
+    if(disc<0)continue;
+    float t=(-b-sqrtf(disc))/(2.0f*a);
+    if(t<0.02f)t=(-b+sqrtf(disc))/(2.0f*a);
+    if(t<0.02f||t>range||t>wall+0.03f||t>=bestt)continue;
+    float y=mx*0.0f + my + dy*t;
+    if(y>e->y && y<e->y+2.0f){ best=i; bestt=t; }
+  }
+  return best;
+}
 static void fire(void){
   if(fireCD>0||rollT>0)return;
-  if(!haspistol||pammo<1){ sfx(V_CLICK); fireCD=0.3f; return; }
-  pammo--; fireCD=0.34f; actT=0.22f;
+  if(!haspistol||pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return; }
+  fireCD=0.34f; actT=0.22f;
+  pammo--;
   sfx(V_SHOT);
-  float dx,dy,dz; player_aim(&dx,&dy,&dz);
-  float ey=player_eye();
-  spawn_bullet(px+dx*0.4f,ey-0.06f+dy*0.4f,pz+dz*0.4f,dx,dy,dz,26.0f,1,0,0);
-  add_templ(px+dx*0.7f,ey+dy*0.7f-0.1f,pz+dz*0.7f,5.0f,0.07f, 1.2f,3.2f,1.8f);
-  mzX=px+dx*0.55f; mzY=ey-0.06f+dy*0.55f; mzZ=pz+dz*0.55f; mzT=0.06f;
-}
-static void throw_pistol(void){
-  if(!haspistol||swingT>0)return;
-  haspistol=0; actT=0.25f;
-  sfx(V_THROW);
-  float dx,dy,dz; player_aim(&dx,&dy,&dz);
-  float ey=player_eye();
-  spawn_bullet(px+dx*0.4f,ey+dy*0.4f,pz+dz*0.4f,dx,dy+0.06f,dz,13.0f,1,1,pammo);
-  pammo=0;
+  float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
+  player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&ld);
+  spawn_bullet(mx,my,mz,dx,dy,dz,PLAYER_BULLET_SPEED,1,0,0,ld>0.02f?ld:0.02f);
+  gunCharge=0;
+  add_templ(mx+dx*0.20f,my+dy*0.20f,mz+dz*0.20f,5.0f,0.07f, 1.2f,3.2f,1.8f);
+  mzX=mx; mzY=my; mzZ=mz; mzT=0.06f;
 }
 static void katana(void){
   if(swingCD>0||swingT>0)return;
@@ -1001,26 +1078,30 @@ static void update_bullets(float wdt){
   for(int i=0;i<MAXBUL;i++){
     Bullet*b=&bul[i]; if(!b->on)continue;
     b->life-=wdt; if(b->life<=0){b->on=0;continue;}
-    if(b->kind==1){ b->vy-=4.0f*wdt; b->spin+=wdt*14; }
     float spd=sqrtf(b->vx*b->vx+b->vy*b->vy+b->vz*b->vz);
     float step=spd*wdt;
     int nsub=(int)(step/0.22f)+1;
     float sdt=wdt/nsub;
     for(int s=0;s<nsub && b->on;s++){
       b->x+=b->vx*sdt; b->y+=b->vy*sdt; b->z+=b->vz*sdt;
+      float moved=spd*sdt;
       /* trail breadcrumb every 0.30 units of travel */
-      b->trd+=spd*sdt;
+      b->trd+=moved;
       if(b->trd>0.30f){ b->trd=0;
         b->tr[b->th][0]=b->x; b->tr[b->th][1]=b->y; b->tr[b->th][2]=b->z;
         b->th=(b->th+1)%TRAILN; if(b->tn<TRAILN)b->tn++;
       }
+      if(b->range>=0){
+        b->range-=moved;
+        if(b->range<=0){
+          spawn_parts(4,b->x,b->y,b->z,1.6f, 0.25f,1.0f,0.55f);
+          add_templ(b->x,b->y,b->z,2.2f,0.06f, 0.35f,1.7f,0.8f);
+          b->on=0; break;
+        }
+      }
       /* walls / floors (raised or not) / ceiling */
       if(b->y>wallh-0.03f ||
          b->y<cellh((int)floorf(b->x/CELL),(int)floorf(b->z/CELL))+0.03f){
-        if(b->kind==1){ /* thrown pistol clatters down, becomes a pickup */
-          float ix=b->x-b->vx*sdt, iz=b->z-b->vz*sdt;
-          add_item(ix,iz,1,b->amt>0?b->amt:2);
-        }
         spawn_parts(7,b->x,b->y,b->z,2.4f, 0.3f,1.1f,0.6f);
         add_templ(b->x,b->y,b->z,3.0f,0.10f, 0.5f,2.0f,1.0f);
         b->on=0; break;
@@ -1038,13 +1119,12 @@ static void update_bullets(float wdt){
         float d2=dx*dx+dz*dz;
         if(d2<1.3f*1.3f && d2>1.0f && (b->vx*dx+b->vz*dz)>0 && frand()<0.5f)
           sfxp(V_WHOOSH, 0.7f+clampf(spd/14.0f,0,1)*0.8f);
-      } else { /* player round / thrown pistol vs agents */
+      } else { /* player round vs agents */
         for(int j=0;j<nen;j++){
           Enemy*e=&en[j]; if(e->state==4)continue;
           float dx=b->x-e->x,dz=b->z-e->z;
           if(dx*dx+dz*dz<0.45f*0.45f && b->y>e->y && b->y<e->y+2.0f){
             shatter_enemy(e);
-            if(b->kind==1)add_item(e->x,e->z,1,b->amt>0?b->amt:2);
             b->on=0; break;
           }
         }
@@ -1061,6 +1141,13 @@ static void update_bullets(float wdt){
 static void update_enemies(float wdt){
   /* aim tokens: only a few agents may draw on you at once, so dense
    * sectors stay a readable bullet hell instead of a firing squad */
+  float diff=(float)curlevel;
+  float moveMul=1.0f+0.10f*diff;
+  float aimTime=0.50f-0.07f*diff;
+  float coolBase=0.70f-0.08f*diff;
+  float shotMul=1.0f+0.10f*diff;
+  float lungeWind=0.32f-0.045f*diff;
+  int maxAim=4+(curlevel>=2);
   int aimers=0;
   for(int i=0;i<nen;i++) if(en[i].state==1)aimers++;
   for(int i=0;i<nen;i++){
@@ -1087,7 +1174,7 @@ static void update_enemies(float wdt){
 
     float dx=px-e->x, dz=pz-e->z, d=sqrtf(dx*dx+dz*dz);
     int see=los(e->x,e->y+1.55f,e->z, px,py+1.2f,pz);
-    float spd = e->type==1?4.4f:2.6f;
+    float spd = (e->type==1?4.4f:2.6f)*moveMul;
     switch(e->state){
       case 0:{ /* advance / reposition */
         e->yaw=atan2f(dx,-dz);
@@ -1106,7 +1193,7 @@ static void update_enemies(float wdt){
         if(e->y-ground_h(e->x,e->z,e->y) > 0.65f){ e->x=ox; e->z=oz; }
         e->anim+=wdt*spd*3.2f;
         e->state_t+=wdt;
-        if(e->type==0){ if(see&&d<15.0f&&d>3.0f&&e->state_t>0&&aimers<4){
+        if(e->type==0){ if(see&&d<15.0f&&d>3.0f&&e->state_t>0&&aimers<maxAim){
                           e->state=1; e->state_t=0; aimers++; } }
         else          { if(d<1.7f&&fabsf(py-e->y)<1.2f&&e->state_t>0){ e->state=3; e->state_t=0; } }
       } break;
@@ -1115,7 +1202,7 @@ static void update_enemies(float wdt){
         e->state_t+=wdt;
         e->armp=clampf(e->state_t/0.25f,0,1);
         if(!see){ e->state=0; e->state_t=0; break; }
-        if(e->state_t>0.5f){
+        if(e->state_t>aimTime){
           /* a three-round fan, aimed at your stance RIGHT NOW —
            * roll under it, jump over it, or stand still and study it */
           float my=e->y+1.36f, aimY=py+1.28f;
@@ -1123,7 +1210,7 @@ static void update_enemies(float wdt){
           for(int k=-1;k<=1;k++){
             float sp=k*0.14f+(frand()-0.5f)*0.03f;
             float bdx=dx+(-dz)*sp, bdz=dz+dx*sp;
-            spawn_bullet(hx,my,hz,bdx,aimY-my,bdz,7.0f+frand()*2.5f,0,0,0);
+            spawn_bullet(hx,my,hz,bdx,aimY-my,bdz,(7.0f+frand()*2.5f)*shotMul,0,0,0,-1);
           }
           e->recoil=1.0f;
           sfxp(V_ESHOT,0.9f+frand()*0.2f);
@@ -1136,12 +1223,12 @@ static void update_enemies(float wdt){
         { float sgn=sinf(e->phase*9)>0?1:-1;
           move_circ(&e->x,&e->z,-dz/d*sgn*1.8f*wdt,dx/d*sgn*1.8f*wdt,0.32f,e->y);
           e->anim+=wdt*5; }
-        if(e->state_t>0.7f+frand()*0.5f){ e->state=0; e->state_t=0; }
+        if(e->state_t>coolBase+frand()*0.5f){ e->state=0; e->state_t=0; }
         break;
       case 3: /* striker lunge */
         e->yaw=atan2f(dx,-dz);
         e->state_t+=wdt;
-        if(e->state_t<0.32f){ /* windup: rear back */ }
+        if(e->state_t<lungeWind){ /* windup: rear back */ }
         else {
           if(d<2.0f && fabsf(py-e->y)<1.3f)hurt_player(26);
           e->state=2; e->state_t=0.4f;   /* borrow cooldown */
@@ -1165,7 +1252,7 @@ static void set_uM(const float*m,float tx,float ty,float tz){
  * Armed only inside the figure draws — shards/items have randomized sizes
  * that would churn the cache. Returns 0 emit, 1 replayed, 2 emit-and-record. */
 static int primArm=0;
-#define MAXPRIM 96
+#define MAXPRIM 128
 static struct { float p[3]; int seg,ring,type; GLuint l; } primc[MAXPRIM];
 static int nprim;
 static int prim_open(int type,float a,float b,float c,int seg,int ring){
@@ -1199,6 +1286,28 @@ static void box_sh(float sx,float sy,float sz){ /* shader-lit box, centred */
   glVertex3f(-x,y,z); glVertex3f(x,y,z); glVertex3f(x,y,-z); glVertex3f(-x,y,-z);
   glNormal3f(0,-1,0);
   glVertex3f(-x,-y,-z); glVertex3f(x,-y,-z); glVertex3f(x,-y,z); glVertex3f(-x,-y,z);
+  glEnd();
+  if(pc==2)glEndList();
+}
+/* Angular tapered block: a cheap prism for hands/feet/gun facets so the
+ * humanoids read as cut polygon mannequins instead of stacked cuboids. */
+static void wedge_sh(float sx,float sy,float sz){
+  int pc=prim_open(3,sx,sy,sz,0,0); if(pc==1)return;
+  float x=sx*0.5f,y=sy*0.5f,z=sz*0.5f;
+  float tx=x*0.72f,tzf=z*0.78f,tzb=z*0.48f;
+  glBegin(GL_QUADS); glTexCoord2f(0.5f,0.5f);
+  glNormal3f(0,-1,0);
+  glVertex3f(-x,-y,-z); glVertex3f(x,-y,-z); glVertex3f(x,-y,z); glVertex3f(-x,-y,z);
+  glNormal3f(0,1,0);
+  glVertex3f(-tx,y,-tzb); glVertex3f(-tx*0.82f,y,tzf); glVertex3f(tx*0.82f,y,tzf); glVertex3f(tx,y,-tzb);
+  glNormal3f(0,0,1);
+  glVertex3f(-x,-y,z); glVertex3f(x,-y,z); glVertex3f(tx*0.82f,y,tzf); glVertex3f(-tx*0.82f,y,tzf);
+  glNormal3f(0,0,-1);
+  glVertex3f(x,-y,-z); glVertex3f(-x,-y,-z); glVertex3f(-tx,y,-tzb); glVertex3f(tx,y,-tzb);
+  glNormal3f(1,0,0);
+  glVertex3f(x,-y,z); glVertex3f(x,-y,-z); glVertex3f(tx,y,-tzb); glVertex3f(tx*0.82f,y,tzf);
+  glNormal3f(-1,0,0);
+  glVertex3f(-x,-y,-z); glVertex3f(-x,-y,z); glVertex3f(-tx*0.82f,y,tzf); glVertex3f(-tx,y,-tzb);
   glEnd();
   if(pc==2)glEndList();
 }
@@ -1251,6 +1360,32 @@ static void sphere_sh(float rx,float ry,float rz,int seg,int ring){
   if(pc==2)glEndList();
 }
 
+static void pistol_sh(const float*W,float gx,float gy,float gz,int ammo){
+  float o[3],M2[9],RX[9];
+  glUniform3f(uTint,0.025f,0.030f,0.032f);
+  m3v(W,0,-0.012f,-0.18f,o);
+  set_uM(W,gx+o[0],gy+o[1],gz+o[2]); wedge_sh(0.060f,0.060f,0.34f);
+  m3v(W,0,-0.010f,-0.38f,o);
+  set_uM(W,gx+o[0],gy+o[1],gz+o[2]); box_sh(0.050f,0.045f,0.045f);
+  m3rotX(RX,-0.58f); m3mul(M2,W,RX);
+  m3v(W,0,-0.145f,-0.020f,o);
+  set_uM(M2,gx+o[0],gy+o[1],gz+o[2]); wedge_sh(0.058f,0.210f,0.078f);
+  glUniform1f(uEmis,1.0f);
+  int pip= ammo<6?ammo:6;
+  for(int q=0;q<6;q++){
+    float live=q<pip?1.0f:0.0f;
+    glUniform3f(uTint,0.05f+live*0.25f,0.18f+live*1.70f,0.08f+live*0.85f);
+    m3v(W,-0.038f+q*0.015f,-0.045f,-0.185f,o);
+    set_uM(W,gx+o[0],gy+o[1],gz+o[2]); box_sh(0.010f,0.024f,0.012f);
+  }
+  if(ammo>6){
+    float rk=clampf((ammo-6)/12.0f,0,1);
+    glUniform3f(uTint,0.10f+0.20f*rk,0.55f+1.30f*rk,0.25f+0.55f*rk);
+    m3v(W,0.065f,-0.010f,-0.060f,o);
+    set_uM(W,gx+o[0],gy+o[1],gz+o[2]); box_sh(0.018f,0.085f*rk,0.018f);
+  }
+}
+
 /* the agents: SUPERHOT-cut crystal humanoids in dark suits, emerald eyes.
  * Hard V-taper silhouette, flat facet planes, eased motion. Suit tint =
  * charcoal mixed with the Doppler shade of their motion. */
@@ -1263,7 +1398,10 @@ static void draw_agent(Enemy*e,float dim){
   float lean = e->state==3 ? (e->state_t<0.32f? -0.35f : 0.5f)
              : (e->type==1&&e->state==0 ? 0.18f : 0.0f);
   lean -= e->recoil*e->recoil*0.10f;            /* fire recoil rocks the torso */
-  m3rotY(R,e->yaw); m3rotX(X,lean); m3mul(M,R,X);
+  /* Enemy AI yaw uses gameplay/shot direction (sin(+yaw), -cos(yaw)), while
+   * m3rotY() maps the model's local -Z forward using the opposite handedness.
+   * Negate only the visual yaw so raised arms/guns point toward their shots. */
+  m3rotY(R,-e->yaw); m3rotX(X,lean); m3mul(M,R,X);
 
   float vr=radial_v(e->x,e->z,e->vx,e->vz);
   float dr,dg,db; dopp_rgb(vr,&dr,&dg,&db);
@@ -1273,7 +1411,13 @@ static void draw_agent(Enemy*e,float dim){
   float sg=(0.090f+e->hue*0.3f)*(1-mixk)+dg*0.22f*mixk;
   float sb= 0.085f            *(1-mixk)+db*0.22f*mixk;
   float fl=e->flash>0?0.6f:0.0f;
-  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); glUniform1f(uEmis,0.12f+fl);
+  int locked = (laserTarget>=0 && laserTarget<nen && e==&en[laserTarget]);
+  if(locked){
+    float p=0.72f+0.28f*sinf(gtime*13.0f);
+    sr=0.95f+0.65f*p; sg=0.10f+0.10f*p; sb=0.06f;
+    fl+=0.45f+0.35f*p;
+  }
+  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); glUniform1f(uEmis,(locked?0.80f:0.12f)+fl);
   glUniform3f(uTint,sr+fl,sg+fl*0.9f,sb+fl*0.8f);
 
   /* legs: swing splits across forward/lateral axes, so strafing reads as
@@ -1297,7 +1441,7 @@ static void draw_agent(Enemy*e,float dim){
     float ank[3]; m3v(LL,0,-0.42f,0,ank);
     float fo[3]; m3v(M,0,-0.02f,-0.07f,fo);
     set_uM(M,kx+ank[0]+fo[0],ky+ank[1]+fo[1],kz+ank[2]+fo[2]);
-    box_sh(0.13f,0.07f,0.27f);
+    wedge_sh(0.12f,0.065f,0.27f);
   }
   /* pelvis + chest: hips wider than the waist, chest flares to the shoulders
    * — the V-taper. Depth-squashed to a slab; idle gets a breathing swell. */
@@ -1340,7 +1484,7 @@ static void draw_agent(Enemy*e,float dim){
     set_uM(F,ex+fac[0],ey+fac[1],ez+fac[2]); cyl_sh(0.058f,0.050f,0.36f,6);
     float hnd[3]; m3v(F,0,-0.36f,0,hnd);
     float hx2=ex+hnd[0],hy2=ey+hnd[1],hz2=ez+hnd[2];
-    set_uM(F,hx2,hy2,hz2); box_sh(0.075f,0.13f,0.06f);    /* wedge mitt */
+    set_uM(F,hx2,hy2,hz2); wedge_sh(0.072f,0.12f,0.060f);  /* cut mitt */
     if(ai&&e->type==0&&raise>0.05f){ /* pistol in the raised hand */
       glUniform3f(uTint,0.03f,0.035f,0.04f);
       float go[3]; m3v(F,0,-0.10f,-0.14f,go);
@@ -1374,18 +1518,33 @@ static void draw_agent(Enemy*e,float dim){
  * somersault it; the camera never rolls with it. */
 static void draw_player(void){
   primArm=1;
-  float M[9],R[9],X[9];
+  float M[9],R[9],X[9],Z[9],S0[9];
   int rolling = rollT>0;
   float rp = rolling? sstep(1.0f-rollT/0.42f) : 0;     /* roll progress 0..1 */
   float tuck = rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
   float tk = 1.0f-0.50f*tuck;                          /* anchors pull in    */
   float walk = sinf(bobT*7.5f), walk2 = sinf(bobT*7.5f+PI);
-  float lean = rolling? rp*2*PI : 0.10f*pmoveb;        /* full forward flip  */
-  m3rotY(R,avYaw); m3rotX(X,lean); m3mul(M,R,X);
-  float pcy=py+0.55f+0.25f*tuck;     /* pivot lifts so the ball clears floor */
-
   float s = swingT>0? clampf(swingT/0.26f,0,1) : 0;    /* katana swing phase */
   int blade = s>0 || swingCD>0;                        /* + follow-through   */
+  int combatStance = !rolling && (blade || haspistol);  /* one yaw convention for all held weapons */
+  int aimStance = haspistol && !rolling && !blade;
+  /* m3rotY() maps the model's local -Z forward to world (sin(-yaw),-cos(yaw));
+   * player_aim() uses (sin(+pyaw),-cos(pyaw)).  Use the negated look yaw for
+   * the visible aiming pose so the body/gun point along the laser instead of
+   * mirroring away from it. */
+  float poseYaw = combatStance ? -pyaw*PI/180.0f : avYaw;
+  float spd=sqrtf(pvx*pvx+pvz*pvz);
+  float run=clampf(spd/5.0f,0,1)*pmoveb;
+  float fwdb=0,latb=0;
+  if(spd>0.05f){
+    float ivx=pvx/spd, ivz=pvz/spd;
+    fwdb=ivx*sinf(poseYaw)-ivz*cosf(poseYaw);
+    latb=ivx*cosf(poseYaw)+ivz*sinf(poseYaw);
+  }
+  float lean = rolling? rp*2*PI : (0.07f+0.07f*clampf(fwdb,0,1))*run; /* athletic forward bias */
+  float sway = rolling? 0 : (-0.10f*latb*run + 0.025f*walk*run);       /* shoulder counter-tilt */
+  m3rotY(R,poseYaw); m3rotZ(Z,sway); m3rotX(X,lean); m3mul(S0,Z,X); m3mul(M,R,S0);
+  float pcy=py+0.55f+0.25f*tuck + (rolling?0:0.025f*fabsf(walk)*run); /* pivot lifts so the ball clears floor */
 
   glUniform1f(uBump,0);
   glUniform1f(uGloss,0.55f);
@@ -1395,20 +1554,24 @@ static void draw_player(void){
   /* legs — tucked hard during the roll */
   for(int li=0;li<2;li++){
     float side=li?0.14f:-0.14f;
-    float sw = rolling? 1.0f : (li?walk:walk2)*0.42f*pmoveb;
-    float kb = rolling? 1.5f : 0.12f+0.30f*clampf(0.5f-0.5f*(li?walk:walk2),0,1)*pmoveb;
+    float stride=li?walk:walk2;
+    float sw = rolling? 1.0f : stride*(0.30f+0.22f*fabsf(fwdb))*run;
+    float sideSw = rolling? 0.0f : -stride*latb*0.22f*run;
+    float kb = rolling? 1.5f : 0.10f+0.38f*clampf(0.5f-0.5f*stride,0,1)*run;
     float hip[3]; m3v(M,side,0.37f*tk,0,hip);
     float hx=px+hip[0], hy=pcy+hip[1], hz=pz+hip[2];
-    float UL[9],RX[9]; m3rotX(RX,sw); m3mul(UL,M,RX);
+    float UL[9],RX[9],RZ[9],LS[9]; m3rotX(RX,sw*fwdb); m3rotZ(RZ,sideSw); m3mul(LS,RX,RZ); m3mul(UL,M,LS);
     float ulc[3]; m3v(UL,0,-0.22f,0,ulc);
     set_uM(UL,hx+ulc[0],hy+ulc[1],hz+ulc[2]); cyl_sh(0.10f,0.076f,0.46f,6);
     float knee[3]; m3v(UL,0,-0.44f,0,knee);
     float kx=hx+knee[0],ky=hy+knee[1],kz=hz+knee[2];
-    float LL[9],RK[9]; m3rotX(RK,sw+kb); m3mul(LL,M,RK);
+    float LL[9],RK[9]; m3rotX(RK,sw*fwdb+kb); m3mul(LS,RK,RZ); m3mul(LL,M,LS);
     float llc[3]; m3v(LL,0,-0.20f,0,llc);
     set_uM(LL,kx+llc[0],ky+llc[1],kz+llc[2]); cyl_sh(0.074f,0.050f,0.42f,6);
     float ank[3]; m3v(LL,0,-0.40f,0,ank);
-    set_uM(LL,kx+ank[0],ky+ank[1],kz+ank[2]); box_sh(0.13f,0.06f,0.24f);
+    float footYaw=(li?1:-1)*latb*0.18f*run;
+    float FM[9],FY[9]; m3rotY(FY,footYaw); m3mul(FM,LL,FY);
+    set_uM(FM,kx+ank[0],ky+ank[1],kz+ank[2]); wedge_sh(0.12f,0.055f,0.24f);
   }
 
   /* pelvis / jacket: same V-taper language as the agents */
@@ -1428,30 +1591,43 @@ static void draw_player(void){
     float raise, swYaw=0;
     if(ai){
       float fr=clampf(fireCD/0.34f,0,1);
-      raise = haspistol&&fr>0 ? (0.85f+0.50f*sstep(fr)) : 0.12f;
-      if(s>0){ raise = 0.5f+0.9f*sinf(s*PI); swYaw = 0.9f-2.0f*sstep(s); }
-      else if(blade) raise=0.35f;
+      raise = aimStance ? (1.18f+0.12f*sstep(fr)) : (haspistol&&fr>0 ? (0.92f+0.42f*sstep(fr)) : 0.12f);
+      if(aimStance) swYaw = -0.12f-0.05f*latb;     /* bring pistol across centerline, not off-wrist */
+      if(s>0){
+        /* Katana sweep: lock the torso in combat yaw and let the arm do the
+         * work.  A compact S-curve avoids the old apparent 180-degree body
+         * flip while still reading as a right-shoulder-to-left-hip cut. */
+        float cut=sstep(s);
+        raise = 1.08f + 0.32f*sinf(s*PI) - 0.30f*cut;
+        swYaw = -0.62f + 1.36f*cut;
+      }
+      else if(blade){ raise=0.52f; swYaw=0.42f; }
     } else raise = 0.0f;
     if(rolling){ raise=1.2f; swYaw=0; }    /* both arms hug the tucked knees */
-    float sw = rolling? 1.0f : (ai?walk2:walk)*0.32f*pmoveb*clampf(1.0f-raise*2.0f,0,1);
+    float armStride=ai?walk2:walk;
+    float aimDamp=ai&&aimStance?0.18f:1.0f;
+    float sw = rolling? 1.0f : armStride*0.34f*run*aimDamp*clampf(1.0f-raise*1.25f,0,1);
     float sh[3]; m3v(M,ai?0.27f:-0.27f,1.05f*tk,0,sh);
     float shx=px+sh[0], shy=pcy+sh[1], shz=pz+sh[2];
     float A[9],RX[9],RY[9],S[9];
-    m3rotX(RX,-raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,M,S);
+    /* Positive X raise swings the arm's local -Y chain toward local -Z
+     * (the avatar's forward).  Negative raise folds it backward over the
+     * shoulder, which made the pistol look 180-degrees flipped. */
+    m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,M,S);
     float uac[3]; m3v(A,0,-0.18f,0,uac);
     set_uM(A,shx+uac[0],shy+uac[1],shz+uac[2]); cyl_sh(0.068f,0.056f,0.36f,6);
     float elb[3]; m3v(A,0,-0.35f,0,elb);
     float ex=shx+elb[0],ey=shy+elb[1],ez=shz+elb[2];
-    float F[9],RE[9]; m3rotX(RE,-raise+sw-0.16f-(ai&&s>0?0.35f:0.0f));
+    float F[9],RE[9]; m3rotX(RE,raise+sw+0.16f+(ai&&s>0?0.18f+0.18f*sinf(s*PI):0.0f));
     m3mul(S,RY,RE); m3mul(F,M,S);
     float fac[3]; m3v(F,0,-0.16f,0,fac);
     set_uM(F,ex+fac[0],ey+fac[1],ez+fac[2]); cyl_sh(0.054f,0.046f,0.34f,6);
     float hnd[3]; m3v(F,0,-0.33f,0,hnd);
     float hx2=ex+hnd[0],hy2=ey+hnd[1],hz2=ez+hnd[2];
-    set_uM(F,hx2,hy2,hz2); box_sh(0.07f,0.12f,0.055f);
+    set_uM(F,hx2,hy2,hz2); wedge_sh(0.068f,0.110f,0.055f);
     if(ai&&blade){
       /* the katana: dark blade, emissive emerald edge, square tsuba */
-      float B[9],RB[9]; m3rotX(RB,-1.35f); m3mul(B,F,RB);
+      float B[9],RB[9]; m3rotX(RB,1.35f); m3mul(B,F,RB);
       float bo[3];
       glUniform3f(uTint,0.10f,0.16f,0.12f);
       m3v(B,0,-0.10f,0,bo);
@@ -1466,10 +1642,42 @@ static void draw_player(void){
       glUniform3f(uTint,0.04f,0.05f,0.045f);
     } else if(ai&&haspistol){
       glUniform3f(uTint,0.03f,0.035f,0.04f);
-      float go[3]; m3v(F,0,-0.08f,-0.12f,go);
-      set_uM(F,hx2+go[0],hy2+go[1],hz2+go[2]); box_sh(0.05f,0.08f,0.22f);
+      float GP[9],GY[9],GX[9],GZ[9],GT[9];
+      /* pistol_sh() barrels down local -Z; the hand/forearm grip runs along
+       * local -Y, so roll the weapon basis 90deg into the palm instead of
+       * letting the barrel stand upright toward the ceiling. */
+      m3rotY(GY,0.04f); m3rotX(GX,-PI*0.5f-0.06f); m3rotZ(GZ,0.04f);
+      m3mul(GT,GY,GX); m3mul(GT,GT,GZ); m3mul(GP,F,GT);
+      /* Anchor the grip into the palm: pistol_sh() places the grip at
+       * local (0,-0.145,-0.020), so offset the gun origin by the inverse of
+       * that grip vector.  A small forearm-up lift keeps it seated visibly in
+       * the hand instead of hanging below the wrist. */
+      float go[3],lift[3]; m3v(GP,0,0.145f,0.020f,go); m3v(F,0,0.125f,0,lift);
+      pistol_sh(GP,hx2+go[0]+lift[0],hy2+go[1]+lift[1],hz2+go[2]+lift[2],pammo);
+      glUniform1f(uEmis,0.08f);
       glUniform3f(uTint,0.04f,0.05f,0.045f);
     }
+  }
+
+  /* Dead-Space-ish health spine: five luminous segments mounted on the back.
+   * This replaces the old corner health bar with feedback that belongs to the
+   * character and stays readable in the closer over-shoulder camera. */
+  {
+    float hp=clampf(php/100.0f,0,1);
+    float hr,hg,hb;
+    if(hp>0.55f){ float k=(hp-0.55f)/0.45f; hr=0.15f*(1-k)+0.05f*k; hg=1.25f; hb=0.35f*(1-k)+0.90f*k; }
+    else if(hp>0.25f){ float k=(hp-0.25f)/0.30f; hr=1.25f*(1-k)+0.25f*k; hg=0.55f*(1-k)+1.15f*k; hb=0.10f*(1-k)+0.30f*k; }
+    else { float k=hp/0.25f; hr=1.55f; hg=0.10f+0.45f*k; hb=0.06f+0.08f*k; }
+    glUniform1f(uEmis,1.0f); glUniform1f(uGloss,0.25f);
+    for(int q=0;q<5;q++){
+      float lit=hp*5.0f-q;
+      lit=clampf(lit,0,1);
+      float pulse=(hp<0.30f)?(0.65f+0.35f*sinf(wtime*12.0f)):1.0f;
+      glUniform3f(uTint,0.035f+hr*lit*pulse,0.060f+hg*lit*pulse,0.045f+hb*lit*pulse);
+      float so[3]; m3v(M,0,0.58f*tk+q*0.105f*tk,0.235f,so);
+      set_uM(M,px+so[0],pcy+so[1],pz+so[2]); box_sh(0.075f,0.070f,0.024f);
+    }
+    glUniform1f(uGloss,0.55f); glUniform1f(uEmis,0.08f);
   }
 
   /* neck / head */
@@ -1477,10 +1685,21 @@ static void draw_player(void){
   { float o[3];
     m3v(M,0,1.10f*tk,0,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.052f,0.062f,0.13f,6);
     m3v(M,0,1.29f*tk,0,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); sphere_sh(0.125f,0.155f,0.135f,6,4);
-    /* slim collar and sunglasses band for the Matrix feel */
+    /* sharp collar plus distinct angular shades — no mouth/smile geometry */
     glUniform3f(uTint,0.02f,0.02f,0.02f);
-    m3v(M,0,1.18f*tk,-0.04f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.18f,0.045f,0.16f);
-    m3v(M,0,1.30f*tk,-0.02f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.20f,0.045f,0.12f); }
+    m3v(M,0,1.18f*tk,0.015f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.19f,0.040f,0.12f);
+    for(int si=-1;si<=1;si+=2){
+      m3v(M,si*0.055f,1.315f*tk,-0.118f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.088f,0.046f,0.030f);
+    }
+    m3v(M,0,1.312f*tk,-0.121f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.036f,0.018f,0.026f);
+    for(int si=-1;si<=1;si+=2){
+      m3v(M,si*0.124f,1.314f*tk,-0.064f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.030f,0.030f,0.095f);
+    }
+    glUniform1f(uEmis,0.65f);
+    glUniform3f(uTint,0.08f,1.25f,0.55f);
+    for(int si=-1;si<=1;si+=2){
+      m3v(M,si*0.076f,1.326f*tk,-0.137f,o); set_uM(M,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.030f,0.006f,0.006f);
+    } }
   glUniform1f(uEmis,0.0f);
   primArm=0;
 }
@@ -1516,19 +1735,6 @@ static void draw_shards(void){
     glUniform3f(uTint,s->r*a*1.6f,s->g*a*1.6f,s->b*a*1.6f);
     set_uM(M,s->x,s->y,s->z);
     box_sh(s->sx,s->sy,s->sz);
-  }
-  glUniform1f(uEmis,0);
-}
-
-/* thrown pistols render as spinning dark hardware in the shader pass */
-static void draw_thrown(void){
-  float M[9],R[9];
-  glUniform1f(uEmis,0.25f); glUniform1f(uBump,0); glUniform1f(uGloss,0.7f);
-  for(int i=0;i<MAXBUL;i++){
-    Bullet*b=&bul[i]; if(!b->on||b->kind!=1)continue;
-    m3rotY(M,b->spin); m3rotX(R,b->spin*0.7f); m3mul(M,M,R);
-    glUniform3f(uTint,0.10f,0.30f,0.18f);
-    set_uM(M,b->x,b->y,b->z); box_sh(0.09f,0.13f,0.32f);
   }
   glUniform1f(uEmis,0);
 }
@@ -1569,7 +1775,7 @@ static void draw_bullets(float my){
   glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
   glBegin(GL_QUADS);
   for(int i=0;i<MAXBUL;i++){
-    Bullet*b=&bul[i]; if(!b->on||b->kind==1)continue;
+    Bullet*b=&bul[i]; if(!b->on)continue;
     float vr=radial_v(b->x,b->z,b->vx,b->vz);
     float r,g,bl; dopp_rgb(vr,&r,&g,&bl);
     billboard(b->x,my*b->y,b->z,0.09f,r,g,bl,0.95f,pyaw+90);
@@ -1595,23 +1801,97 @@ static void draw_lasers(void){
   glEnd();
 }
 
+/* Charged-shot confirmation: if the current laser ray/range can actually hit
+ * a living enemy before geometry blocks it, wrap that enemy in animated
+ * emerald target brackets. No bracket means the shot would not reach. */
+static void draw_laser_lock(void){
+  if(laserTarget<0||laserTarget>=nen)return;
+  Enemy*e=&en[laserTarget]; if(e->state==4)return;
+  float pulse=0.65f+0.35f*sinf(gtime*12.0f);
+  float r=0.58f+0.05f*pulse, y0=e->y+0.12f, y1=e->y+2.04f;
+  float l=0.22f+0.08f*pulse;
+  glLineWidth(2.4f+1.0f*pulse);
+  glBegin(GL_LINES);
+  glColor4f(0.15f,1.65f,0.70f,0.72f+0.22f*pulse);
+  for(int sx=-1;sx<=1;sx+=2)for(int sz=-1;sz<=1;sz+=2){
+    float x=e->x+sx*r, z=e->z+sz*r;
+    /* vertical corner post */
+    glVertex3f(x,y0,z); glVertex3f(x,y0+l,z);
+    glVertex3f(x,y1-l,z); glVertex3f(x,y1,z);
+    /* short top/bottom feet pointing inward along both axes */
+    glVertex3f(x,y0,z); glVertex3f(x-sx*l,y0,z);
+    glVertex3f(x,y0,z); glVertex3f(x,y0,z-sz*l);
+    glVertex3f(x,y1,z); glVertex3f(x-sx*l,y1,z);
+    glVertex3f(x,y1,z); glVertex3f(x,y1,z-sz*l);
+  }
+  glEnd();
+  glLineWidth(1.0f);
+}
+
+/* player laser pointer: the replacement for the old screen-space crosshair. */
+static void draw_player_laser(void){
+  if(gstate!=ST_PLAY||!haspistol||pammo<=0||rollT>0||swingT>0||swingCD>0)return;
+  float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
+  player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&ld);
+  float charge=clampf(gunCharge,0,1);
+  int locked = laserTarget>=0;
+  /* Keep the charge read stable: length carries the information, not flicker. */
+  float grow=sstep(charge);
+  float pulse=0.98f+0.02f*sinf(gtime*6.0f);
+  float fullx=mx+dx*GUN_MAX_RANGE, fully=my+dy*GUN_MAX_RANGE, fullz=mz+dz*GUN_MAX_RANGE;
+  float ghost=0.030f;
+  /* Faint full-length rail so the growing active segment has a clear direction. */
+  glLineWidth(0.75f);
+  glBegin(GL_LINES);
+  glColor4f(locked?0.22f:0.01f,locked?0.04f:0.18f,locked?0.03f:0.08f,ghost*(locked?1.8f:1.0f));
+  glVertex3f(mx,my,mz);
+  glColor4f(locked?0.16f:0.01f,locked?0.02f:0.10f,locked?0.02f:0.05f,ghost*(locked?0.9f:0.45f));
+  glVertex3f(fullx,fully,fullz);
+  glEnd();
+  if(ld>0.03f){
+    glLineWidth(1.4f+2.4f*grow);
+    glBegin(GL_LINES);
+    glColor4f((locked?1.45f:0.07f)*pulse,(locked?0.20f:1.25f)*pulse,(locked?0.10f:0.58f)*pulse,0.36f+0.22f*grow);
+    glVertex3f(mx,my,mz);
+    glColor4f((locked?1.05f:0.04f)*pulse,(locked?0.12f:0.90f)*pulse,(locked?0.08f:0.42f)*pulse,0.28f+0.28f*grow);
+    glVertex3f(hx,hy,hz);
+    glEnd();
+  }
+  glLineWidth(1.0f);
+  glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
+  glBegin(GL_QUADS);
+  /* March small ticks down the charged section so length growth is visible even at shallow angles. */
+  int ticks=(int)(2+grow*11);
+  for(int q=1;q<=ticks;q++){
+    float f=(float)q/(ticks+1), a=(0.08f+0.18f*f)*(0.35f+0.65f*grow);
+    billboard(mx+(hx-mx)*f,my+(hy-my)*f,mz+(hz-mz)*f,0.020f+0.035f*grow,
+      locked?0.95f:0.04f,locked?0.13f:0.70f+0.65f*grow,locked?0.08f:0.28f,a,pyaw+90);
+  }
+  /* Leading cap: mostly constant size; position moving outward is the reload read. */
+  billboard(hx,hy,hz,0.080f+0.055f*grow,locked?1.90f:0.28f,locked?0.28f:1.90f,locked?0.12f:0.78f,0.84f,pyaw+90);
+  billboard(hx,hy,hz,0.190f+0.090f*grow,locked?0.75f:0.04f,locked?0.10f:0.75f,locked?0.06f:0.28f,0.28f,pyaw+90);
+  glEnd();
+  glDisable(GL_TEXTURE_2D);
+}
+
 /* the katana's wake: an emerald crescent swept across the cut plane,
  * strongest at the blade and fading along the arc behind it */
 static void draw_slash(void){
   if(swingT<=0)return;
   float s=clampf(swingT/0.26f,0,1);
   float yr=pyaw*PI/180.0f;
-  float aS=yr+1.30f, aE=aS-2.40f*sstep(s);
-  float cy=py+1.25f;
+  float cut=sstep(s);
+  float aS=yr-0.76f, aE=aS+1.42f*cut;
+  float cy=py+1.34f;
   glBegin(GL_TRIANGLE_STRIP);
   for(int k=0;k<=16;k++){
     float f=k/16.0f, a=aS+(aE-aS)*f;
-    float yk=cy+0.40f-0.65f*f;                /* high left -> low right */
-    float al=0.55f*f*f*(0.4f+0.6f*s);
+    float yk=cy+0.24f-0.58f*f;                /* high right -> low left diagonal */
+    float al=0.62f*f*f*(0.35f+0.65f*cut);
     float sa=sinf(a),ca=-cosf(a);
     glColor4f(0.20f*al,1.00f*al,0.45f*al,al);
-    glVertex3f(px+sa*0.50f,yk,pz+ca*0.50f);
-    glVertex3f(px+sa*1.60f,yk-0.10f,pz+ca*1.60f);
+    glVertex3f(px+sa*0.54f,yk,pz+ca*0.54f);
+    glVertex3f(px+sa*1.48f,yk-0.08f,pz+ca*1.48f);
   }
   glEnd();
 }
@@ -1664,7 +1944,7 @@ static void draw_world(float camx,float camy,float camz){
       if(en[i].y>0.2f || ddx*ddx+ddz*ddz>22.0f*22.0f)continue;
       draw_agent(&en[i],0.6f);
     }
-    draw_shards(); draw_thrown();
+    draw_shards();
     refl=0;
     /* mirrored additive trails, faint */
     glUseProgram(0);
@@ -1717,7 +1997,6 @@ static void draw_world(float camx,float camy,float camz){
   if(gstate==ST_PLAY) draw_player();
   draw_items();
   draw_shards();
-  draw_thrown();
   glUseProgram(0);
 
   /* additive pass: light orbs, particles, trails, lasers */
@@ -1746,6 +2025,7 @@ static void draw_world(float camx,float camy,float camz){
   glEnd();
   draw_bullets(1.0f);
   draw_lasers();
+  draw_player_laser();
   if(gstate==ST_PLAY)draw_slash();
   glDisable(GL_BLEND);
   glDepthMask(GL_TRUE);
@@ -1788,25 +2068,12 @@ static void draw_hud(void){
   glEnd();
 
   if(gstate==ST_PLAY||gstate==ST_WIN){
-    /* crosshair: dot + ticks */
-    glColor4f(0.5f,1,0.7f,0.85f);
-    glBegin(GL_QUADS);
-    glVertex2f(WINW/2-1,WINH/2-1);glVertex2f(WINW/2+1,WINH/2-1);
-    glVertex2f(WINW/2+1,WINH/2+1);glVertex2f(WINW/2-1,WINH/2+1);
-    glEnd();
-    glColor4f(0.5f,1,0.7f,0.4f);
-    glBegin(GL_QUADS);
-    glVertex2f(WINW/2-10,WINH/2-0.7f);glVertex2f(WINW/2-5,WINH/2-0.7f);
-    glVertex2f(WINW/2-5,WINH/2+0.7f);glVertex2f(WINW/2-10,WINH/2+0.7f);
-    glVertex2f(WINW/2+5,WINH/2-0.7f);glVertex2f(WINW/2+10,WINH/2-0.7f);
-    glVertex2f(WINW/2+10,WINH/2+0.7f);glVertex2f(WINW/2+5,WINH/2+0.7f);
-    glEnd();
-    if(rollCD>0){ /* roll recharge: a sliver under the crosshair */
+    if(rollCD>0){ /* minimal remaining HUD: roll recharge */
       float k=1.0f-rollCD/0.65f;
       glColor4f(0.4f,0.9f,0.6f,0.55f);
       glBegin(GL_QUADS);
-      glVertex2f(WINW/2-12,WINH/2+16);glVertex2f(WINW/2-12+24*k,WINH/2+16);
-      glVertex2f(WINW/2-12+24*k,WINH/2+18);glVertex2f(WINW/2-12,WINH/2+18);
+      glVertex2f(WINW/2-28,WINH-42);glVertex2f(WINW/2-28+56*k,WINH-42);
+      glVertex2f(WINW/2-28+56*k,WINH-39);glVertex2f(WINW/2-28,WINH-39);
       glEnd();
     }
 
@@ -1814,22 +2081,9 @@ static void draw_hud(void){
     { char b2[24]; snprintf(b2,24,"AGENTS %02d",nalive);
       glColor4f(0.6f,1.0f,0.75f,0.9f);
       draw_text(WINW-30-textw(b2,2.6f),26,2.6f,b2); }
-    /* hp bar bottom left */
-    glColor4f(0,0,0,0.5f);
-    glBegin(GL_QUADS);glVertex2f(28,WINH-50);glVertex2f(232,WINH-50);glVertex2f(232,WINH-32);glVertex2f(28,WINH-32);glEnd();
-    glColor4f(0.2f,0.95f,0.5f,0.85f);
-    float hw=200*php/100.0f;
-    glBegin(GL_QUADS);glVertex2f(30,WINH-48);glVertex2f(30+hw,WINH-48);glVertex2f(30+hw,WINH-34);glVertex2f(30,WINH-34);glEnd();
-    glColor4f(0.8f,1,0.9f,0.8f); draw_text(30,WINH-72,2.0f,"SIGNAL");
-    /* ammo / blade, bottom right */
-    if(haspistol){ char am[8]; snprintf(am,8,"%02d",pammo);
-      glColor4f(0.5f,1.0f,0.7f,0.95f);
-      draw_text(WINW-30-textw(am,4.4f),WINH-64,4.4f,am);
-      glColor4f(0.7f,1,0.85f,0.6f); draw_text(WINW-30-textw("ROUNDS",1.8f),WINH-84,1.8f,"ROUNDS");
-    } else {
-      glColor4f(0.7f,1.0f,0.85f,0.9f);
-      draw_text(WINW-30-textw("BLADE",3),WINH-58,3,"BLADE");
-    }
+    { char b2[24]; snprintf(b2,24,"AMMO %02d",pammo);
+      glColor4f(pammo>0?0.55f:1.0f,pammo>0?1.0f:0.25f,pammo>0?0.70f:0.18f,0.9f);
+      draw_text(WINW-30-textw(b2,2.2f),58,2.2f,b2); }
     /* level intro card */
     if(msgT>0){
       float a=clampf(msgT,0,1);
@@ -1884,8 +2138,8 @@ static void draw_hud(void){
     glColor4f(0.35f,0.55f,0.42f,1);
     draw_text((WINW-textw("WASD MOVE - SPACE JUMP AND JUMP AGAIN - WALLS KICK BACK - SHIFT ROLL",1.55f))/2,608,1.55f,
       "WASD MOVE - SPACE JUMP AND JUMP AGAIN - WALLS KICK BACK - SHIFT ROLL");
-    draw_text((WINW-textw("LMB FIRE - RMB KATANA - F THROW - 1-3 SECTOR",1.55f))/2,632,1.55f,
-      "LMB FIRE - RMB KATANA - F THROW - 1-3 SECTOR");
+    draw_text((WINW-textw("LMB FIRE - MOVE TO CHARGE RANGE - FIND AMMO - RMB KATANA - 1-3 SECTOR",1.55f))/2,632,1.55f,
+      "LMB FIRE - MOVE TO CHARGE RANGE - FIND AMMO - RMB KATANA - 1-3 SECTOR");
   } else if(gstate==ST_DEAD){
     glColor4f(0,0,0,0.6f);
     glBegin(GL_QUADS);glVertex2f(0,0);glVertex2f(WINW,0);glVertex2f(WINW,WINH);glVertex2f(0,WINH);glEnd();
@@ -1987,7 +2241,7 @@ int main(int argc,char**argv){
   glDisable(GL_CULL_FACE);
   glClearColor(0.004f,0.012f,0.008f,1);
 
-  int running=1, frame=0, wdown=0,adown=0,sdown=0,ddown=0,mdown=0;
+  int running=1, frame=0, wdown=0,adown=0,sdown=0,ddown=0;
   unsigned last=SDL_GetTicks();
   float titleYaw=0;
   gstate=ST_TITLE;
@@ -2001,7 +2255,6 @@ int main(int argc,char**argv){
         switch(ev.key.keysym.sym){
           case SDLK_w:wdown=d;break; case SDLK_a:adown=d;break;
           case SDLK_s:sdown=d;break; case SDLK_d:ddown=d;break;
-          case SDLK_f: if(d&&gstate==ST_PLAY)throw_pistol(); break;
           case SDLK_SPACE:
             if(d&&gstate==ST_PLAY&&rollT<=0){
               float gh=ground_h(px,pz,py), wnx,wnz;
@@ -2054,9 +2307,8 @@ int main(int argc,char**argv){
       else if(ev.type==SDL_MOUSEBUTTONDOWN && ev.button.button==SDL_BUTTON_LEFT){
         if(gstate==ST_TITLE){ reset_game(); gstate=ST_PLAY; SDL_SetRelativeMouseMode(SDL_TRUE); sfx(V_CLICK); }
         else if(gstate==ST_DEAD||gstate==ST_WIN){ reset_game(); gstate=ST_PLAY; SDL_SetRelativeMouseMode(SDL_TRUE); }
-        else mdown=1;
+        else fire();
       }
-      else if(ev.type==SDL_MOUSEBUTTONUP && ev.button.button==SDL_BUTTON_LEFT)mdown=0;
       else if(ev.type==SDL_MOUSEBUTTONDOWN && ev.button.button==SDL_BUTTON_RIGHT && gstate==ST_PLAY)
         katana();
     }
@@ -2082,6 +2334,10 @@ int main(int argc,char**argv){
         }
         pyaw=besta*180/PI; ppitch=2;
       }
+      /* Push the avatar through a short deterministic run so the harness
+       * captures the third-person locomotion pose, not just idle/combat. */
+      wdown = frame>=32 && frame<64;
+      adown = sdown = ddown = 0;
       if(frame==40&&nen>0){ /* stage a shooter dead ahead, mid-aim */
         float yr=pyaw*PI/180;
         for(float d=5.5f;d>2.0f;d-=0.3f){
@@ -2092,6 +2348,7 @@ int main(int argc,char**argv){
             en[0].type=0; en[0].state=1; en[0].state_t=0.3f; break; }
         }
       }
+      if(frame==58)shot_ppm("shot_run_pose.ppm");
       if(frame>=70&&frame<80&&nen>0){ /* track it for the camera */
         float dx=en[0].x-px, dz=en[0].z-pz;
         float d=sqrtf(dx*dx+dz*dz);
@@ -2099,10 +2356,13 @@ int main(int argc,char**argv){
         ppitch=atan2f(EYE-1.3f,d)*180/PI;
       }
       if(frame==76)fire();
+      if(frame==82)shot_ppm("shot_gun_pose.ppm");
       if(frame==84)shot_ppm("shot_game.ppm");
       if(frame==100&&nen>0)shatter_enemy(&en[0]);
       if(frame==106)shot_ppm("shot_shatter.ppm");
-      if(frame>=130){ printf("[doppler] SMOKE OK\n"); running=0; }
+      if(frame==112)katana();
+      if(frame==118)shot_ppm("shot_katana_pose.ppm");
+      if(frame>=142){ printf("[doppler] SMOKE OK\n"); running=0; }
     }
 
     if(gstate==ST_TITLE){ titleYaw+=dt*7; pyaw=titleYaw; ppitch=4;
@@ -2119,6 +2379,7 @@ int main(int argc,char**argv){
       float ox=px,oz=pz;
       if(rollT>0){                 /* the roll owns the legs while it runs */
         rollT-=dt;
+        if(rollT<0)rollT=0;
         move_circ(&px,&pz,rollDX*8.5f*dt,rollDZ*8.5f*dt,0.34f,py);
         spawn_parts(2,px-rollDX*0.4f,py+0.45f,pz-rollDZ*0.4f,0.6f, 0.10f,0.50f,0.25f);
       } else if(ml>0.01f){
@@ -2164,8 +2425,18 @@ int main(int argc,char**argv){
       wdt=dt*tscale;
       wtime+=wdt;
 
-      if(mdown)fire();
       if(fireCD>0)fireCD-=dt;
+      if(haspistol&&pammo>0){
+        /* Recharge from actual movement, not raw input/roll state. This avoids
+         * hidden roll-time charge jumps and makes blocked movement charge less. */
+        float groundDrive=clampf(sqrtf(pvx*pvx+pvz*pvz)/5.0f,0,1);
+        if(rollCD>0.20f && groundDrive>0.55f)groundDrive=0.55f; /* dodge is evasive, not a free reload */
+        float chargeDrive = groundDrive>0.02f ? groundDrive : GUN_IDLE_CHARGE;
+        if(air && chargeDrive<0.45f)chargeDrive=0.45f;
+        if(look>chargeDrive)chargeDrive=look;
+        gunCharge=clampf(gunCharge+dt*chargeDrive/GUN_CHARGE_TIME,0,1);
+      } else gunCharge=0;
+      laserTarget=laser_target();
       if(swingCD>0)swingCD-=dt;
       if(swingT>0){
         float pt=swingT; swingT+=dt;
@@ -2188,7 +2459,8 @@ int main(int argc,char**argv){
         if(dx*dx+dz*dz<0.8f*0.8f && fabsf(floor_at(items[i].x,items[i].z)-py)<1.4f){
           items[i].taken=1; sfx(V_PICK);
           if(items[i].type==0){ php+=35; if(php>100)php=100; }
-          else { haspistol=1; pammo+=items[i].amt; if(pammo>18)pammo=18; }
+          else { haspistol=1; pammo+=items[i].amt; if(pammo>PLAYER_MAX_AMMO)pammo=PLAYER_MAX_AMMO;
+                 gunCharge=clampf(gunCharge+items[i].amt/24.0f,0,1); }
         }
       }
     }
@@ -2229,10 +2501,10 @@ int main(int argc,char**argv){
     /* third-person boom with occlusion: cast at the desired offset, snap IN
      * the moment something blocks (never clip), ease back OUT smoothly.
      * Vertical follows a smoothed pivot so rolls and landings don't pop. */
-    float pivy=(gstate==ST_PLAY?player_camh():EYE)+0.18f;
+    float pivy=(gstate==ST_PLAY?player_camh():EYE)+0.10f;
     if(camYs<0)camYs=pivy;
     camYs=toward(camYs,pivy,dt*10.0f);
-    float ox2=-fx*4.05f+rx*0.70f, oz2=-fz*4.05f+rz*0.70f;
+    float ox2=-fx*2.90f+rx*1.08f, oz2=-fz*2.90f+rz*1.08f;
     float boom=sqrtf(ox2*ox2+oz2*oz2);
     float ux=ox2/boom, uz=oz2/boom;
     float hit=ray_wall(px,camYs,pz,ux,0,uz,boom+0.30f);
