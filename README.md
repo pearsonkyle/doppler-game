@@ -9,8 +9,6 @@ SDL2, the whole game is one `.c` file and compiles to under ~150Kb.
 
 ![Title screen](screenshots/shot_title.png)
 
-## Features
-
 | Features | Image |
 | --- | --- |
 | **Locomotion** - Run, dodge, double-jump or wall-kick your way around enemies and incoming fire. | ![Run](screenshots/shot_run_pose.png) |
