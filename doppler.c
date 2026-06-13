@@ -1394,6 +1394,19 @@ static void update_boss(Enemy*e,float wdt){
   float bspd = 6.5f + e->bphase*1.5f;
   float my   = e->y+0.9f;        /* fire low so the spiral sweeps the floor   */
 
+  /* vertical lead toward the player's torso. when they climb a corner pyramid
+     or hang off the map edge to grab a cache, the boss pitches its fire up so
+     the high ground stops being a free sniping perch. */
+  float aimY    = py+0.9f;
+  float vslope  = (aimY-my)/d;                 /* rise-over-run to the player  */
+  int   elevated= py > e->y+1.2f;
+  /* free-running rhythm clock: the fountain fires in waves with a short rest,
+     so the floor always has a timed pocket to advance or grab a cache through
+     — the breather that keeps it a dodgeable hell, not a solid wall of lead.  */
+  e->state_t += wdt;
+  float beatT  = e->bphase==2?2.6f:3.0f;
+  int   resting= fmodf(e->state_t,beatT) > beatT-(e->bphase==2?0.45f:0.65f);
+
   e->yaw=atan2f(dx,-dz);
   /* stride drivers: moveb is a smoothed 0..1 walk blend, anim the gait phase —
      its cadence rises with ground speed so the legs/arms read the movement */
@@ -1426,17 +1439,38 @@ static void update_boss(Enemy*e,float wdt){
   if(wdt>1e-4f){ e->vx=airborne?e->vx:(e->x-e->lx)/wdt; e->vz=airborne?e->vz:(e->z-e->lz)/wdt; }
   e->lx=e->x; e->lz=e->z;
 
-  /* the spiral fountain */
+  /* the spiral fountain — the dodgeable base pattern. its arms leave rotating
+     gaps to thread between; when the player takes the high ground the whole
+     cone tilts up to follow them. it falls silent during the rest beat so a
+     navigable pocket opens on the floor every cycle. */
   e->spiralA += wdt*spin;
   e->atkCD   -= wdt;
-  if(!airborne && e->atkCD<=0){
+  if(!airborne && !resting && e->atkCD<=0){
     e->atkCD=cad;
+    float sv = elevated ? clampf(vslope*0.6f,0.0f,1.4f) : 0.02f;
     for(int k=0;k<arms;k++){ float a=e->spiralA + k*2*PI/arms;
-      spawn_bullet(e->x,my,e->z, sinf(a),0.02f,-cosf(a), bspd,0,0,0,-1); }
+      spawn_bullet(e->x,my,e->z, sinf(a),sv,-cosf(a), bspd,0,0,0,-1); }
     if(e->bphase==2)
       for(int k=0;k<arms;k++){ float a=-e->spiralA + k*2*PI/arms + 0.3f;
-        spawn_bullet(e->x,my,e->z, sinf(a),0.02f,-cosf(a), bspd*0.85f,0,0,0,-1); }
+        spawn_bullet(e->x,my,e->z, sinf(a),sv,-cosf(a), bspd*0.85f,0,0,0,-1); }
     sfx3(V_ESHOT,0.6f,e->x,my,e->z);
+  }
+
+  /* aimed lance — the only volley with true vertical tracking. a tight fan
+     loosed straight at the player and pitched to their height, so a perch or
+     an over-the-edge ledge no longer dodges the boss. it keeps firing through
+     the rest beat (the floor breather is for the spiral, not a free pass) and
+     comes tighter and twice as often when the player is elevated, to deny
+     camping the ammo pyramids. the fan's own gaps stay dodgeable by strafing. */
+  e->phase -= wdt;
+  if(!airborne && e->phase<=0){
+    e->phase = (e->bphase==0?1.9f:e->bphase==1?1.5f:1.1f) * (elevated?0.55f:1.0f);
+    int   N      = e->bphase==0?3:5;
+    float base   = atan2f(dx,-dz);
+    float spread = elevated?0.10f:0.17f;
+    for(int k=0;k<N;k++){ float a=base+(k-(N-1)*0.5f)*spread;
+      spawn_bullet(e->x,my+0.5f,e->z, sinf(a),vslope,-cosf(a), bspd*1.2f,0,0,0,-1); }
+    sfx3(V_ESHOT,0.72f,e->x,my,e->z);
   }
 
   /* periodic leap toward the player */
