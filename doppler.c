@@ -550,7 +550,8 @@ static void gen_level(int li,unsigned seedmix){
  * read by the audio callback — a word-sized store, same lock-free style the
  * original used for voices[]. */
 enum { V_SHOT, V_ESHOT, V_DEFLECT, V_SWING, V_SHATTER, V_HURT,
-       V_PICK, V_STEP, V_CLICK, V_WIN, V_WHOOSH, V_THROW };
+       V_PICK, V_STEP, V_CLICK, V_WIN, V_WHOOSH, V_THROW,
+       V_ROLL, V_JUMP, V_KICK, V_LAND };
 typedef struct { int type,on,world; float t,p; } Voice;
 static Voice voices[MAXVOICE];
 static int audioOK=0; static SDL_AudioDeviceID adev;
@@ -560,7 +561,10 @@ static float arand(void){ arng^=arng<<13;arng^=arng>>17;arng^=arng<<5; return (a
 
 static void sfxp(int type,float pitch){
   if(!audioOK)return;
-  int world = !(type==V_CLICK||type==V_WIN||type==V_PICK);
+  /* player-time voices: UI plus your own body — they never pitch-bend
+   * with the frozen world, because you always move in real time */
+  int world = !(type==V_CLICK||type==V_WIN||type==V_PICK
+              ||type==V_ROLL||type==V_JUMP||type==V_KICK||type==V_LAND);
   for(int i=0;i<MAXVOICE;i++) if(!voices[i].on){
     voices[i].type=type; voices[i].t=0; voices[i].p=pitch; voices[i].world=world;
     voices[i].on=1; return; }
@@ -623,6 +627,20 @@ static void audio_cb(void*ud,Uint8*stream,int len){
         case V_THROW:{ lps+=0.15f*(arand()-lps);
           s+=lps*expf(-t*9)*0.9f + sinf(2*PI*(300-t*500)*t)*expf(-t*8)*0.2f;
           if(t>0.4f)voices[v].on=0; }break;
+        case V_ROLL:{ /* the dodge: a fast cloth-and-air whoosh */
+          lps+=(0.08f+0.45f*t)*(arand()-lps);
+          float env=1.0f-t*2.5f; if(env<0)env=0;
+          s+=lps*env*1.1f;
+          if(t>0.4f)voices[v].on=0; }break;
+        case V_JUMP:{ float f=(260.0f+t*1700.0f)*p;
+          s+=sinf(2*PI*f*t)*expf(-t*18)*0.30f + arand()*expf(-t*40)*0.15f;
+          if(t>0.25f)voices[v].on=0; }break;
+        case V_KICK:{ float f=(120.0f-t*160.0f)*p; if(f<40)f=40;
+          s+=sinf(2*PI*f*t)*expf(-t*14)*0.5f + arand()*expf(-t*50)*0.25f;
+          if(t>0.3f)voices[v].on=0; }break;
+        case V_LAND:{ s+=sinf(2*PI*55.0f*t)*expf(-t*18)*0.55f*p
+            + arand()*expf(-t*35)*0.2f;
+          if(t>0.3f)voices[v].on=0; }break;
       }
       voices[v].t += (voices[v].world?ats:1.0f)/44100.0f;
     }
@@ -768,6 +786,9 @@ static float kvx,kvz;                       /* wall-kick horizontal impulse   */
 static float pmoveb;                        /* idle<->run blend for the avatar*/
 static float avYaw;                         /* smoothed avatar facing (rad)   */
 static float camDist=4.05f,camYs=-1.0f;     /* smoothed camera boom + height  */
+static float coyT;                          /* coyote time: late edge jumps   */
+static float hurtCD;                        /* post-hit mercy window          */
+static float mzT,mzX,mzY,mzZ;               /* avatar muzzle flash            */
 
 static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_eye(void){ return py + (rollT>0 ? 0.55f : 1.52f); }
@@ -784,6 +805,7 @@ static void reset_game(void){
   php=100; pammo=6; haspistol=1; jumps=1;
   tscale=1; actT=0; mouseAcc=0;
   rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=0;
+  coyT=hurtCD=mzT=0;
   camDist=4.05f; camYs=-1.0f;
   fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=wtime=0;
   msgT=3.0f;
@@ -879,7 +901,8 @@ static void dopp_rgb(float vr,float*r,float*g,float*b){
 
 /* ---------------------------------------------------------------- combat */
 static void hurt_player(float dmg){
-  if(gstate!=ST_PLAY)return;
+  if(gstate!=ST_PLAY||hurtCD>0)return;   /* mercy: one fan can't double-tap */
+  hurtCD=0.45f;
   php-=dmg; dmgFlash=0.6f; shake=0.3f; sfx(V_HURT);
   if(php<=0){ php=0; gstate=ST_DEAD; SDL_SetRelativeMouseMode(SDL_FALSE); }
 }
@@ -923,6 +946,7 @@ static void fire(void){
   float ey=player_eye();
   spawn_bullet(px+dx*0.4f,ey-0.06f+dy*0.4f,pz+dz*0.4f,dx,dy,dz,26.0f,1,0,0);
   add_templ(px+dx*0.7f,ey+dy*0.7f-0.1f,pz+dz*0.7f,5.0f,0.07f, 1.2f,3.2f,1.8f);
+  mzX=px+dx*0.55f; mzY=ey-0.06f+dy*0.55f; mzZ=pz+dz*0.55f; mzT=0.06f;
 }
 static void throw_pistol(void){
   if(!haspistol||swingT>0)return;
@@ -1035,6 +1059,10 @@ static void update_bullets(float wdt){
  * you, because the world only freezes, never stops. Strikers just run you
  * down and lunge. All of it advances on world-time. */
 static void update_enemies(float wdt){
+  /* aim tokens: only a few agents may draw on you at once, so dense
+   * sectors stay a readable bullet hell instead of a firing squad */
+  int aimers=0;
+  for(int i=0;i<nen;i++) if(en[i].state==1)aimers++;
   for(int i=0;i<nen;i++){
     Enemy*e=&en[i];
     if(e->flash>0)e->flash-=wdt;
@@ -1078,7 +1106,8 @@ static void update_enemies(float wdt){
         if(e->y-ground_h(e->x,e->z,e->y) > 0.65f){ e->x=ox; e->z=oz; }
         e->anim+=wdt*spd*3.2f;
         e->state_t+=wdt;
-        if(e->type==0){ if(see&&d<15.0f&&d>3.0f&&e->state_t>0){ e->state=1; e->state_t=0; } }
+        if(e->type==0){ if(see&&d<15.0f&&d>3.0f&&e->state_t>0&&aimers<4){
+                          e->state=1; e->state_t=0; aimers++; } }
         else          { if(d<1.7f&&fabsf(py-e->y)<1.2f&&e->state_t>0){ e->state=3; e->state_t=0; } }
       } break;
       case 1: /* aim: eyes flare, arm rises */
@@ -1699,6 +1728,11 @@ static void draw_world(float camx,float camy,float camz){
   for(int i=0;i<nlights;i++)
     billboard(lights[i].x,lights[i].y,lights[i].z,0.30f,
       lights[i].cr*0.22f,lights[i].cg*0.22f,lights[i].cb*0.22f,1,pyaw+90);
+  if(mzT>0){ /* the avatar's muzzle flash */
+    float a=mzT/0.06f;
+    billboard(mzX,mzY,mzZ,0.10f+0.10f*a, 0.9f,1.8f,1.0f,a,pyaw+90);
+    billboard(mzX,mzY,mzZ,0.30f, 0.25f,0.9f,0.45f,a*0.5f,pyaw+90);
+  }
   glEnd();
   glDisable(GL_TEXTURE_2D);
   glPointSize(4);
@@ -1767,6 +1801,14 @@ static void draw_hud(void){
     glVertex2f(WINW/2+5,WINH/2-0.7f);glVertex2f(WINW/2+10,WINH/2-0.7f);
     glVertex2f(WINW/2+10,WINH/2+0.7f);glVertex2f(WINW/2+5,WINH/2+0.7f);
     glEnd();
+    if(rollCD>0){ /* roll recharge: a sliver under the crosshair */
+      float k=1.0f-rollCD/0.65f;
+      glColor4f(0.4f,0.9f,0.6f,0.55f);
+      glBegin(GL_QUADS);
+      glVertex2f(WINW/2-12,WINH/2+16);glVertex2f(WINW/2-12+24*k,WINH/2+16);
+      glVertex2f(WINW/2-12+24*k,WINH/2+18);glVertex2f(WINW/2-12,WINH/2+18);
+      glEnd();
+    }
 
     /* agents remaining, top right */
     { char b2[24]; snprintf(b2,24,"AGENTS %02d",nalive);
@@ -1963,16 +2005,18 @@ int main(int argc,char**argv){
           case SDLK_SPACE:
             if(d&&gstate==ST_PLAY&&rollT<=0){
               float gh=ground_h(px,pz,py), wnx,wnz;
-              if(py<=gh+0.001f){ pvy=7.5f; jumps=1; actT=0.20f; }
+              if(py<=gh+0.001f||coyT>0){ /* coyote: late edge jumps count */
+                pvy=7.5f; jumps=1; actT=0.20f; coyT=0; sfx(V_JUMP);
+              }
               else if(wall_kick(px,pz,py,&wnx,&wnz)){
                 /* kick off the wall: up and away, air jump restored */
-                pvy=7.4f; kvx=wnx*5.5f; kvz=wnz*5.5f; jumps=1; actT=0.20f;
+                pvy=7.4f; kvx=wnx*6.0f; kvz=wnz*6.0f; jumps=1; actT=0.20f;
                 spawn_parts(8,px-wnx*0.4f,py+0.8f,pz-wnz*0.4f,2.5f, 0.30f,1.2f,0.6f);
-                sfxp(V_STEP,1.6f);
+                sfx(V_KICK);
               }
               else if(jumps>0){ jumps--; pvy=6.6f; actT=0.20f;
                 spawn_parts(10,px,py+0.1f,pz,2.2f, 0.25f,1.1f,0.55f);
-                sfxp(V_SWING,1.8f);
+                sfxp(V_JUMP,1.3f);
               }
             } break;
           case SDLK_LCTRL: case SDLK_RCTRL: case SDLK_c:
@@ -1986,8 +2030,8 @@ int main(int argc,char**argv){
               if(ml2<0.01f){ float yr2=pyaw*PI/180;
                 mx=sinf(yr2); mz=-cosf(yr2); ml2=1; }
               rollDX=mx/ml2; rollDZ=mz/ml2;
-              rollT=0.42f; rollCD=0.75f; actT=0.42f;
-              sfxp(V_SWING,0.7f);
+              rollT=0.42f; rollCD=0.65f; actT=0.42f;
+              sfx(V_ROLL);
             } break;
           case SDLK_1: case SDLK_2: case SDLK_3:
             if(d&&gstate==ST_TITLE){ curlevel=ev.key.keysym.sym-SDLK_1; sfx(V_CLICK); }
@@ -2076,6 +2120,7 @@ int main(int argc,char**argv){
       if(rollT>0){                 /* the roll owns the legs while it runs */
         rollT-=dt;
         move_circ(&px,&pz,rollDX*8.5f*dt,rollDZ*8.5f*dt,0.34f,py);
+        spawn_parts(2,px-rollDX*0.4f,py+0.45f,pz-rollDZ*0.4f,0.6f, 0.10f,0.50f,0.25f);
       } else if(ml>0.01f){
         mx/=ml;mz/=ml;
         move_circ(&px,&pz,mx*5.0f*dt,mz*5.0f*dt,0.34f,py);
@@ -2097,8 +2142,16 @@ int main(int argc,char**argv){
       pvy-=18.0f*dt;
       py += pvy*dt;
       float gh=ground_h(px,pz,py);
-      if(py<gh){ if(pvy<-9.0f)sfxp(V_STEP,0.6f); py=gh; pvy=0; jumps=1; }
+      if(py<gh){
+        if(pvy<-7.0f){           /* a real landing: thud, dust, camera dip */
+          sfxp(V_LAND,clampf(-pvy/14.0f,0.5f,1.2f));
+          spawn_parts(9,px,gh+0.05f,pz,1.6f, 0.18f,0.55f,0.30f);
+          if(shake<0.06f)shake=0.06f;
+        }
+        py=gh; pvy=0; jumps=1;
+      }
       int air = py>gh+0.01f;
+      coyT = air? coyT-dt : 0.12f;
 
       float look=clampf(mouseAcc*0.05f,0,1); mouseAcc=0;
       if(actT>0)actT-=dt;
@@ -2120,6 +2173,8 @@ int main(int argc,char**argv){
         if(swingT>0.26f)swingT=0;
       }
       if(dmgFlash>0)dmgFlash-=dt;
+      if(hurtCD>0)hurtCD-=dt;
+      if(mzT>0)mzT-=dt;
       if(shake>0)shake-=dt*1.2f;
       if(msgT>0)msgT-=dt;
       winT+=dt;
