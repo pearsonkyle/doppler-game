@@ -1,8 +1,8 @@
-# DOPPLER
+# Δ
 
 **Time moves when you move.**
 
-A single-file SUPERHOT × *Matrix* homage in the demoscene tradition: one C file,
+A single-file SUPERHOT × *Matrix* × **TRON** homage in the demoscene tradition: one C file,
 no assets on disk, no engine. Every texture, level, mesh, sound, and font is
 synthesized at startup or runtime. Stripped down to immediate-mode OpenGL 2 and
 SDL2, the whole game is one `.c` file and compiles to under ~150Kb.
@@ -24,16 +24,16 @@ Requires SDL2 and OpenGL.
 
 ```sh
 ./build.sh        # clang on macOS, gcc on Linux
-./doppler         # play
-./doppler --level 2   # jump straight to a sector (0-based)
-./doppler --seed 1234 # reseed the procedural levels
+./dilation         # play
+./dilation --level 2   # jump straight to a sector (0-based)
+./dilation --seed 1234 # reseed the procedural levels
 ```
 
 Or build by hand:
 
 ```sh
-gcc -Os doppler.c -o doppler -lSDL2 -lGL -lm        # Linux
-clang -Os doppler.c -o doppler -I/opt/homebrew/include -L/opt/homebrew/lib \
+gcc -Os dilation.c -o dilation -lSDL2 -lGL -lm        # Linux
+clang -Os dilation.c -o dilation -I/opt/homebrew/include -L/opt/homebrew/lib \
   -lSDL2 -framework OpenGL -lm                       # macOS (Homebrew SDL2)
 ```
 
@@ -54,7 +54,7 @@ Clear every agent in a sector to win.
 
 ## Regression mode
 
-`./doppler --smoke` runs a fixed, deterministic choreography and writes nine PPM
+`./dilation --smoke` runs a fixed, deterministic choreography and writes nine PPM
 screenshots, then prints `SMOKE OK`. It forces `tscale=1` and fixed RNG seeds,
 so output is byte-stable run-to-run — a cheap visual/behavioral regression gate
 for refactors.

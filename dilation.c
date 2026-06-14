@@ -1,5 +1,5 @@
 /* ============================================================================
- * DOPPLER — time moves when you move.
+ * ΔILATION — time moves when you move.
  *
  * A single-file SUPERHOT x Matrix homage built on the .murkk/.kkrieger rules:
  *   - one C file, no assets on disk, no engine
@@ -21,8 +21,8 @@
  * mid-air rebounds you upward, SHIFT/CTRL dodge-rolls under fire. Sectors are
  * built vertically: platforms, stairs, train roofs, mezzanines.
  *
- * build: gcc -Os doppler.c -o doppler -lSDL2 -lGL -lm
- * smoke: ./doppler --smoke      (headless-friendly; writes PPM screenshots)
+ * build: gcc -Os dilation.c -o dilation -lSDL2 -lGL -lm
+ * smoke: ./dilation --smoke      (headless-friendly; writes PPM screenshots)
  * license: CC0 / public domain. greets to .theprodukkt & SUPERHOT team.
  * ==========================================================================*/
 
@@ -260,7 +260,7 @@ static void gen_textures(void){
 
 /* ---------------------------------------------------------------- 5x7 bitfont
  * 0-9 A-Z and '-' ; 7 row bytes per glyph, bit4 = leftmost column. */
-static const unsigned char font[37][7]={
+static const unsigned char font[38][7]={
  {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
  {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
  {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
@@ -279,14 +279,15 @@ static const unsigned char font[37][7]={
  {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},{0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
  {0x11,0x11,0x11,0x15,0x15,0x1B,0x11},{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
  {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
- {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}};
+ {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
+ {0x04,0x04,0x0A,0x0A,0x11,0x11,0x1F}};  /* 37 = delta wordmark glyph */
 
 static float textw(const char*s,float sc){ return (float)strlen(s)*6*sc; }
 static void draw_text(float x,float y,float sc,const char*s){
   glBegin(GL_QUADS);
   for(;*s;s++,x+=6*sc){
     int gi=-1; char c=*s;
-    if(c>='0'&&c<='9')gi=c-'0'; else if(c>='A'&&c<='Z')gi=10+c-'A'; else if(c=='-')gi=36;
+    if(c>='0'&&c<='9')gi=c-'0'; else if(c>='A'&&c<='Z')gi=10+c-'A'; else if(c=='-')gi=36; else if(c=='^')gi=37;
     if(gi<0)continue;
     for(int r=0;r<7;r++){ unsigned char row=font[gi][r];
       for(int col=0;col<5;col++) if(row&(0x10>>col)){
@@ -967,7 +968,7 @@ static GLuint shader(GLenum ty,const char*src){
   glShaderSource(s,1,&src,0); glCompileShader(s);
   GLint ok; glGetShaderiv(s,GL_COMPILE_STATUS,&ok);
   if(!ok){ char log[2048]; glGetShaderInfoLog(s,2048,0,log);
-    fprintf(stderr,"[doppler] shader fail:\n%s\n",log); exit(1); }
+    fprintf(stderr,"[dilation] shader fail:\n%s\n",log); exit(1); }
   return s;
 }
 static void init_shaders(void){
@@ -977,7 +978,7 @@ static void init_shaders(void){
   glLinkProgram(prog);
   GLint ok; glGetProgramiv(prog,GL_LINK_STATUS,&ok);
   if(!ok){ char log[2048]; glGetProgramInfoLog(prog,2048,0,log);
-    fprintf(stderr,"[doppler] link fail:\n%s\n",log); exit(1); }
+    fprintf(stderr,"[dilation] link fail:\n%s\n",log); exit(1); }
   uCam=glGetUniformLocation(prog,"uCam");   uNL =glGetUniformLocation(prog,"uNL");
   uLpos=glGetUniformLocation(prog,"uLpos[0]"); uLcol=glGetUniformLocation(prog,"uLcol[0]");
   uM3 =glGetUniformLocation(prog,"uM3");    uT  =glGetUniformLocation(prog,"uT");
@@ -2786,9 +2787,9 @@ static void draw_hud(void){
     glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     /* shadowed wordmark */
     glColor4f(0.0f,0.25f,0.10f,0.9f);
-    draw_text((WINW-textw("DOPPLER",13))/2+5,125,13,"DOPPLER");
+    draw_text((WINW-textw("^ILATION",13))/2+5,125,13,"^ILATION");
     glColor4f(0.65f,1.0f,0.75f,1);
-    draw_text((WINW-textw("DOPPLER",13))/2,120,13,"DOPPLER");
+    draw_text((WINW-textw("^ILATION",13))/2,120,13,"^ILATION");
     glColor4f(0.35f,0.85f,0.55f,1);
     draw_text((WINW-textw("TIME MOVES WHEN YOU MOVE",2.6f))/2,250,2.6f,"TIME MOVES WHEN YOU MOVE");
     /* level select */
@@ -2845,7 +2846,7 @@ static void shot_ppm(const char*path){
     fprintf(f,"P6\n%d %d\n255\n",WINW,WINH);
     for(int y=WINH-1;y>=0;y--) fwrite(buf+y*WINW*3,1,WINW*3,f);
     fclose(f);
-    printf("[doppler] wrote %s\n",path);
+    printf("[dilation] wrote %s\n",path);
   }
   free(buf);
 }
@@ -2877,36 +2878,36 @@ int main(int argc,char**argv){
   SDL_InitSubSystem(SDL_INIT_AUDIO);
   SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,24);
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER,1);
-  SDL_Window*win=SDL_CreateWindow("DOPPLER",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
+  SDL_Window*win=SDL_CreateWindow("Δilation",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
     WINW,WINH,SDL_WINDOW_OPENGL);
   SDL_GLContext ctx=SDL_GL_CreateContext(win);
   if(!ctx){ fprintf(stderr,"GL: %s\n",SDL_GetError()); return 1; }
   SDL_GL_SetSwapInterval(smoke||titlecap?0:1);
   load_gl();
-  printf("[doppler] GL: %s / %s\n",glGetString(GL_RENDERER),glGetString(GL_VERSION));
+  printf("[dilation] GL: %s / %s\n",glGetString(GL_RENDERER),glGetString(GL_VERSION));
 
   t0=SDL_GetTicks(); gen_textures();
-  printf("[doppler] textures synthesized in %ums\n",SDL_GetTicks()-t0);
+  printf("[dilation] textures synthesized in %ums\n",SDL_GetTicks()-t0);
   if(smoke){ /* sanity: every sector must carve and populate */
     for(int l=0;l<NLEVEL;l++){
       gen_level(l,gseed);
-      printf("[doppler] sector %d %-8s: %d agents, %d quads\n",
+      printf("[dilation] sector %d %-8s: %d agents, %d quads\n",
         l+1,LEVELS[l].name,nen,(bn[0]+bn[1]+bn[2])/32);
       float sy=cellh((int)(startx/CELL),(int)(startz/CELL));
       if(nen<1||sy>100.0f||!circ_free(startx,startz,0.34f,sy)){
-        fprintf(stderr,"[doppler] SMOKE FAIL: bad sector %d\n",l); return 1; }
+        fprintf(stderr,"[dilation] SMOKE FAIL: bad sector %d\n",l); return 1; }
     }
   }
   t0=SDL_GetTicks(); reset_game();
-  printf("[doppler] world carved in %ums (%d quads)\n",SDL_GetTicks()-t0,(bn[0]+bn[1]+bn[2])/32);
+  printf("[dilation] world carved in %ums (%d quads)\n",SDL_GetTicks()-t0,(bn[0]+bn[1]+bn[2])/32);
   init_shaders();
-  printf("[doppler] shaders up\n");
+  printf("[dilation] shaders up\n");
 
   SDL_AudioSpec want={0},have;
   want.freq=44100; want.format=AUDIO_F32SYS; want.channels=2; want.samples=512; want.callback=audio_cb;
   adev=SDL_OpenAudioDevice(0,0,&want,&have,0);
-  if(adev){ audioOK=1; SDL_PauseAudioDevice(adev,0); printf("[doppler] audio up\n"); }
-  else printf("[doppler] no audio device, running silent\n");
+  if(adev){ audioOK=1; SDL_PauseAudioDevice(adev,0); printf("[dilation] audio up\n"); }
+  else printf("[dilation] no audio device, running silent\n");
 
   glEnable(GL_DEPTH_TEST);
   glDisable(GL_CULL_FACE);
@@ -3001,7 +3002,7 @@ int main(int argc,char**argv){
         shot_ppm(nm);
       }
       frame++;
-      if(frame>=366){ printf("[doppler] TITLECAP wrote %d frames\n",(frame-6)/3); running=0; }
+      if(frame>=366){ printf("[dilation] TITLECAP wrote %d frames\n",(frame-6)/3); running=0; }
     }
 
     /* smoke choreography: gen-check done above; now title shot, jack in,
@@ -3097,7 +3098,7 @@ int main(int argc,char**argv){
       }
       if(frame>=138&&frame<146)ppitch=4;
       if(frame==144)shot_ppm("shot_dodge.ppm");
-      if(frame>=150){ printf("[doppler] SMOKE OK\n"); running=0; }
+      if(frame>=150){ printf("[dilation] SMOKE OK\n"); running=0; }
     }
 
     if(gstate==ST_TITLE){ titleYaw+=dt*7; pyaw=titleYaw; ppitch=4;
