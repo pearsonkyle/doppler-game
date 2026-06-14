@@ -643,7 +643,8 @@ typedef struct { int type,on,world; float t,p,gl,gr,lp; } Voice;
 static Voice voices[MAXVOICE];
 static int audioOK=0; static SDL_AudioDeviceID adev;
 static volatile float g_ats=1.0f;
-static volatile int g_track=0;   /* music: 0 MENU, 1=LOBBY, 2=SUBWAY, 3=TERMINAL */
+static volatile int g_track=0;   /* music: 0 MENU,1=LOBBY,2=SUBWAY,3=TERMINAL,4=OVERLORD */
+static volatile int g_mute=0;    /* 'm' toggles: silences output, clocks keep running */
 static unsigned arng=0xBADC0DEu;
 static float arand(void){ arng^=arng<<13;arng^=arng>>17;arng^=arng<<5; return (arng&0xffffff)/(float)0x800000-1.0f; }
 static float px,pz,pyaw;   /* player pose; full definition with the game state below */
@@ -676,55 +677,94 @@ static void sfx3(int type,float pitch,float x,float y,float z){
 
 /* ---------------------------------------------------------------- music
  * Per-level driving trance, fully synthesized in the audio thread: a 16th-
- * note step sequencer (kick / hats / bass / supersaw arp / pad). It keeps
- * its own clock so it can partial-detune with the world while SFX detune
- * fully. g_track picks the track; MENU is lighter, levels escalate. */
-static float msaw(float ph){ ph-=floorf(ph); return 2.0f*ph-1.0f; }
-static float ntof(float root,int semi){ return root*powf(2.0f,semi/12.0f); }
+ * note step sequencer (kick / hats / bass / supersaw lead / pad). It keeps
+ * its own real-time clock and never detunes with the world (only SFX do), so
+ * the groove stays steady. g_track picks the track; MENU is lighter. */
+/* Anti-aliased sawtooth (2-point PolyBLEP). t and the per-sample phase
+ * increment dt are in cycles [0,1); the blep rounds the wrap discontinuity so
+ * high notes lose their harsh digital aliasing whine. */
+static float psaw(float t,float dt){
+  float v=2.0f*t-1.0f;
+  if(dt>0.0f){
+    if(t<dt){ float x=t/dt; v-=x+x-x*x-1.0f; }
+    else if(t>1.0f-dt){ float x=(t-1.0f)/dt; v-=x*x+x+x+1.0f; }
+  }
+  return v;
+}
+/* 2^(semi/12) lookup so the per-sample oscillators never call powf. Filled by
+ * music_init() for semi in [-48,48]; out-of-range notes clamp to the ends. */
+static float semitab[97];
+static float ntof(float root,int semi){ semi+=48; if(semi<0)semi=0; else if(semi>96)semi=96; return root*semitab[semi]; }
 
-/* arp = per-16th, bass = per-quarter; semitone offsets from the track root */
-static const int arp_menu[]  ={0,7,12,7, 3,7,10,7};
-static const int arp_lobby[] ={0,12,7,12, 14,12,7,12}; /* deadmau5 pluck: root/5/oct/9, transposes with prog */
-/* SUBWAY: driving "Blade"-style electro lead in A minor — root pulse + octave
- * stabs, then a climbing answer (0=A 3=C 5=D 7=E 8=F 10=G 12=A); -100 = rest */
-static const int arp_subway[]={
-  0,  0,12, 0,  3,-100, 0,-100,  5, 0,12, 0,  3,-100, 5, 7,
-  0,  0,12, 0,  3,-100, 0,-100,  8, 7, 5, 7,  8,10,12,-100};
-static const int arp_term[]  ={0,12,3,12, 7,12,3,15, 0,10,3,10, 8,12,3,12};
+/* ------------------------------------------------------ note-string framework
+ * Melodies and chord progressions are written as readable space-separated note
+ * strings ("G1 G1 G2 D#2 ...") and parsed once at startup into semitone-offset
+ * step arrays. Tokens: a note (A-G, optional #/b, scientific octave, A1=55Hz),
+ * "." for a rest, and a "*N" suffix that repeats the previous step N sixteenths
+ * (so a held note like "B1*12" re-plucks across its steps — the driving pulse). */
+static int notemidi(const char*s){          /* "A#2" -> MIDI number (A1=33) */
+  int pc; switch(s[0]){case 'C':pc=0;break;case 'D':pc=2;break;case 'E':pc=4;break;
+    case 'F':pc=5;break;case 'G':pc=7;break;case 'A':pc=9;break;case 'B':pc=11;break;
+    default:pc=0;} int i=1;
+  if(s[i]=='#'){pc++;i++;} else if(s[i]=='b'){pc--;i++;}
+  int neg=0; if(s[i]=='-'){neg=1;i++;} int oct=0;
+  while(s[i]>='0'&&s[i]<='9'){oct=oct*10+(s[i]-'0');i++;}
+  return ((neg?-oct:oct)+1)*12+pc;
+}
+static int parse_mel(const char*str,const char*rootname,int*out,int max){
+  int root=notemidi(rootname),n=0; const char*p=str;
+  while(*p){
+    while(*p==' ')p++; if(!*p)break;
+    int val;
+    if(*p=='.'){ val=-100; p++; }                 /* rest */
+    else { val=notemidi(p)-root; p++;             /* note -> offset from root */
+      if(*p=='#'||*p=='b')p++; if(*p=='-')p++;
+      while(*p>='0'&&*p<='9')p++; }
+    int rep=1;
+    if(*p=='*'){ p++; rep=0; while(*p>='0'&&*p<='9')rep=rep*10+(*p++-'0'); if(rep<1)rep=1; }
+    while(rep-->0&&n<max) out[n++]=val;
+  }
+  return n;
+}
+
+/* bass = per-quarter; semitone offsets from the track root */
 static const int bass_menu[]  ={0,0,-5,-5};
 static const int bass_lobby[] ={0,0,0,-2, -5,-5,3,3};
 static const int bass_subway[]={0,0,-5,3, -7,-7,0,0};
 static const int bass_term[]  ={0,-2,-5,-7, 0,3,5,7};
 
-/* Sandstorm-style chord stabs: triads as semitones from E, then a per-16th
- * sequence of chord ids with the classic repeat counts (the driving riff). */
-static const int CH_EM[3]={0,3,7};      /* E minor       E-G-B           */
-static const int CH_C [3]={3,8,12};     /* C maj 2nd inv  G-C-E          */
-static const int CH_G [3]={3,7,10};     /* G major       G-B-D           */
-static const int CH_D [3]={-2,2,5};     /* D major       D-F#-A          */
-static const int CH_AM[3]={5,8,12};     /* A minor       A-C-E           */
-static const int*const STAB_CH[5]={CH_EM,CH_C,CH_G,CH_D,CH_AM};
-static const int STAB_SEQ[]={           /* Em5 C3 G3 D1 Em5 Am1 Em5 +Am1 */
-  0,0,0,0,0, 1,1,1, 2,2,2, 3, 0,0,0,0,0, 4, 0,0,0,0,0, 4 };
-#define STABN ((int)(sizeof(STAB_SEQ)/sizeof(STAB_SEQ[0])))
-
-/* deadmau5-style chord progression for LOBBY: chord-root offsets from A,
- * one chord per bar — Am F C G (i VI III VII). progn>0 turns on the
- * sidechain pump and makes pad/bass/arp follow the changing chord root. */
-static const int prog_lobby[]={0,-4,3,-2};
-
-typedef struct { float bpm,root; const int*arp; int arpn;
-                 const int*bass; int bassn; int full,stab;
-                 const int*prog; int progn; } Track;
-static const Track TRACKS[4]={
-  {110.0f, 55.00f, arp_menu,   8, bass_menu,   4, 0,0, 0,0},         /* MENU  : ambient    */
-  {118.0f, 55.00f, arp_lobby,  8, bass_lobby,  8, 1,0, prog_lobby,4},/* LOBBY : deadmau5   */
-  {114.0f, 55.00f, arp_subway,32, bass_subway, 8, 1,0, 0,0},         /* SUBWAY: Blade lead */
-  {122.0f, 41.20f, arp_term,  16, bass_term,   8, 1,1, 0,0},         /* TERM  : Sandstorm  */
+/* One track table. root names the tonic (sets synth frequency and the parse
+ * origin for mel/prog). mel = lead step string; div = sixteenths per melody note
+ * (1 = one note per 16th; 2 = half-speed 8th-note lead). prog = chord-root string
+ * (NULL = static key, no sidechain pump) advancing every proglen sixteenths. The
+ * lead stays fixed over a moving prog, so boss chords sweep underneath the riff.
+ * svf routes the lead through the resonant filtered-saw voice (the boss). */
+typedef struct { const char*root; float bpm; const char*mel; int div; const char*prog;
+                 int proglen; const int*bass; int bassn; int full; int svf; } Track;
+static const Track TRACKS[5]={
+  /* MENU  : ambient title pulse                 */ {"A1", 110.0f, "A1 E2 A2 E2 C2 E2 G2 E2", 1, 0, 16, bass_menu, 4, 0,0},
+  /* LOBBY : dark G riff over an i-VI-III-VII pump*/ {"G1", 118.0f, "G1 G1 G1 G2 D2 D#2 D#2 D#2 D#2 D2", 2, "G1 D#1 A#1 F1", 16, bass_lobby, 8, 1,0},
+  /* SUBWAY: A# octave / fifth / b9 driver        */ {"A#1",114.0f, "A#2 F2 A#1 B1 B1 B1 A#2 F2 A#2 B1 A#2 B1 A#2", 2, 0, 16, bass_subway, 8, 1,0},
+  /* TERM  : pulsing B techno line                */ {"B1", 122.0f, "B1*12 E2*7 D2*7 A1 B1*12 D2 B1*12", 1, 0, 16, bass_term, 8, 1,0},
+  /* OVERLORD: Daft-Punk lead riff over Em-D-A-C   */ {"E1", 120.0f, ".*6 G1*2 F#1*4 G1*2 A1*4 G1*4 F#1*4 G1*4 B1*2", 1, "E1 D1 A1 C1", 8, bass_term, 8, 1,1},
 };
 
+/* parsed melodies / progressions + tonic frequency, filled once by music_init() */
+#define MELMAX 64
+static int   mel_buf[5][MELMAX], mel_n[5];
+static int   prog_buf[5][16],    prog_n[5];
+static float track_hz[5];
+static void music_init(void){
+  for(int k=-48;k<=48;k++) semitab[k+48]=powf(2.0f,k/12.0f);
+  for(int i=0;i<5;i++){
+    mel_n[i]  = TRACKS[i].mel  ? parse_mel(TRACKS[i].mel ,TRACKS[i].root, mel_buf[i], MELMAX) : 0;
+    prog_n[i] = TRACKS[i].prog ? parse_mel(TRACKS[i].prog,TRACKS[i].root, prog_buf[i], 16)    : 0;
+    track_hz[i] = 440.0f*powf(2.0f,(notemidi(TRACKS[i].root)-69)/12.0f);
+  }
+}
+
 static float music_sample(double mt,int track){
-  if(track<0)track=0; if(track>3)track=3;
+  if(track<0)track=0; if(track>4)track=4;
   const Track*T=&TRACKS[track];
   static double pmt=0; float dt=(float)(mt-pmt); pmt=mt;
   if(dt<0)dt=0; if(dt>0.05f)dt=0;            /* guard first call / track switch */
@@ -735,22 +775,23 @@ static float music_sample(double mt,int track){
   float in16=(float)(s16-(double)step)/(float)(bps*4.0); /* sec into this 16th  */
   float beatpos=(float)(mt*bps-floor(mt*bps));           /* 0..1 within quarter */
   float secInBeat=beatpos/(float)bps;                    /* sec into the beat   */
-  float root=T->root, out=0;
+  float root=track_hz[track], out=0;
 
-  /* progression (deadmau5 tracks): chord root moves each bar; the kick ducks
-   * the pad/bass via a sidechain envelope, giving the "pumping" breath. */
-  int prog_on=T->progn>0;
-  int poff=prog_on ? T->prog[(int)(step/16)%T->progn] : 0;
+  /* progression: chord root moves every proglen 16ths; the kick ducks the
+   * pad/bass via a sidechain envelope, giving the "pumping" breath. */
+  int prog_on=prog_n[track]>0;
+  int plen=T->proglen>0?T->proglen:16;
+  int poff=prog_on ? prog_buf[track][(int)(step/plen)%prog_n[track]] : 0;
   float sc=prog_on ? 0.28f+0.72f*(1.0f-expf(-secInBeat*7.0f)) : 1.0f;
 
-  /* pad: sustained open chord (root/5/oct over a prog, minor triad otherwise) */
+  /* pad: sustained open chord (root/5/oct over a prog, minor triad otherwise).
+   * Oscillator phases live in cycles [0,1) so psaw needs no 2*PI scaling. */
   static float pp0=0,pp1=0,pp2=0;
   int o0=12, o1=prog_on?19:15, o2=prog_on?24:19;
-  pp0=fmodf(pp0+2*PI*ntof(root,poff+o0)*dt,2*PI);
-  pp1=fmodf(pp1+2*PI*ntof(root,poff+o1)*dt,2*PI);
-  pp2=fmodf(pp2+2*PI*ntof(root,poff+o2)*dt,2*PI);
+  float d0=ntof(root,poff+o0)*dt, d1=ntof(root,poff+o1)*dt, d2=ntof(root,poff+o2)*dt;
+  pp0+=d0; pp0-=floorf(pp0); pp1+=d1; pp1-=floorf(pp1); pp2+=d2; pp2-=floorf(pp2);
   float padlfo=0.6f+0.4f*sinf((float)mt*0.4f);
-  out += (msaw(pp0/(2*PI))*0.5f+msaw(pp1/(2*PI))*0.4f+msaw(pp2/(2*PI))*0.4f)
+  out += (psaw(pp0,d0)*0.5f+psaw(pp1,d1)*0.4f+psaw(pp2,d2)*0.4f)
          *(prog_on?0.085f:0.05f)*padlfo*sc;
 
   /* bass: prog tracks the chord root (steady, sidechained); else the per-beat
@@ -758,40 +799,42 @@ static float music_sample(double mt,int track){
   static float pb=0, lpb=0;
   int bidx=(int)(((long)(mt*bps))%T->bassn); if(bidx<0)bidx+=T->bassn;
   int bsemi=prog_on ? poff : T->bass[bidx];
-  pb=fmodf(pb+2*PI*ntof(root,bsemi)*dt,2*PI);
+  float db=ntof(root,bsemi)*dt;
+  pb+=db; pb-=floorf(pb);
   float bgate=prog_on ? sc : expf(-fmodf(secInBeat*(float)bps*2.0f,1.0f)*5.0f);
-  lpb += 0.25f*(msaw(pb/(2*PI))*0.5f-lpb);
+  lpb += 0.25f*(psaw(pb,db)*0.5f-lpb);
   out += lpb*bgate*(prog_on?0.34f:0.32f);
 
-  /* lead: detuned supersaw through an LFO-swept lowpass. Either a single-note
-   * arp, or (T->stab) the Sandstorm chord-stab progression. */
-  static float pa0=0,pa1=0,pa2=0, lpa=0;
-  float aatk=in16<0.004f?in16/0.004f:1.0f;
-  float cut=0.08f+0.20f*(0.5f+0.5f*sinf((float)mt*1.3f));
-  if(T->stab){
-    int si=(int)(step%STABN); if(si<0)si+=STABN;
-    const int*ch=STAB_CH[STAB_SEQ[si]];
-    float aenv=expf(-in16*9.0f);            /* tight staccato stab */
-    float chord=0;
-    for(int k=0;k<3;k++){
-      double f=ntof(root,ch[k]+24);         /* two octaves up, bright */
-      double q1=f*0.997*mt; q1-=floor(q1);
-      double q2=f*1.003*mt; q2-=floor(q2);
-      chord += (2.0f*(float)q1-1.0f)+(2.0f*(float)q2-1.0f);
-    }
-    chord*=1.0f/6.0f;
-    lpa += cut*(chord-lpa);
-    out += (lpa*0.7f+chord*0.3f)*aenv*aatk*0.32f;
-  } else {
-    int aidx=(int)(step%T->arpn); if(aidx<0)aidx+=T->arpn;
-    int asemi=T->arp[aidx];
-    if(asemi>-50){
-      float fa=ntof(root,asemi+poff+12);   /* follow the chord root on prog tracks */
-      pa0=fmodf(pa0+2*PI*fa*0.994f*dt,2*PI);
-      pa1=fmodf(pa1+2*PI*fa*dt,2*PI);
-      pa2=fmodf(pa2+2*PI*fa*1.007f*dt,2*PI);
-      float aenv=expf(-in16*7.0f);
-      float saws=(msaw(pa0/(2*PI))+msaw(pa1/(2*PI))+msaw(pa2/(2*PI)))*0.33f;
+  /* lead: one detuned supersaw voice reading the parsed melody, div sixteenths
+   * per note (so a higher div is a slower lead). The plain path is an LFO-swept
+   * lowpass pluck; T->svf routes it through a resonant 2-pole filter plucked
+   * open per note and sidechain-pumped — the boss "house" lead. */
+  static float pa0=0,pa1=0,pa2=0, lpa=0, svf_lo=0, svf_bp=0;
+  int div=T->div>0?T->div:1;
+  double sNote=s16/(double)div; long lstep=(long)sNote;
+  float inNote=(float)(sNote-(double)lstep)*(float)div/(float)(bps*4.0); /* sec into note */
+  int aidx=mel_n[track]?(int)(lstep%mel_n[track]):0; if(aidx<0)aidx+=mel_n[track];
+  int asemi=mel_n[track]?mel_buf[track][aidx]:-100;
+  if(asemi>-50){
+    float aatk=inNote<0.004f?inNote/0.004f:1.0f;
+    float da=ntof(root,asemi+12)*dt, da0=da*0.994f, da2=da*1.007f;
+    pa0+=da0; pa0-=floorf(pa0); pa1+=da; pa1-=floorf(pa1); pa2+=da2; pa2-=floorf(pa2);
+    float saws=(psaw(pa0,da0)+psaw(pa1,da)+psaw(pa2,da2))*0.33f;
+    if(T->svf){
+      /* fat detuned saws → gentle grit → resonant lowpass whose cutoff is
+       * plucked open per note and slow-swept by an LFO, then sidechain-pumped
+       * against the four-on-the-floor kick (Benny-Benassi "Satisfaction" lead). */
+      float drv=tanhf(saws*1.7f)*(expf(-inNote*4.0f)*aatk);
+      float fenv=expf(-inNote*7.0f);
+      float fc=(220.0f+fenv*2800.0f)*(0.70f+0.45f*(0.5f+0.5f*sinf((float)mt*0.5f)));
+      if(fc>7000.0f)fc=7000.0f;
+      float fco=2.0f*sinf(PI*fc/44100.0f), res=1.05f;  /* res<2; lower = more squelch */
+      float hp=drv-svf_lo-res*svf_bp; svf_bp+=fco*hp; svf_lo+=fco*svf_bp;
+      float pump=0.30f+0.70f*(1.0f-expf(-secInBeat*9.0f));
+      out += svf_lo*pump*0.45f;
+    } else {
+      float cut=0.08f+0.20f*(0.5f+0.5f*sinf((float)mt*1.3f));
+      float aenv=expf(-inNote*8.0f);                   /* tight staccato pluck */
       lpa += cut*(saws-lpa);
       out += (lpa*0.7f+saws*0.3f)*aenv*aatk*(T->full?0.34f:0.22f);
     }
@@ -800,7 +843,6 @@ static float music_sample(double mt,int track){
   if(T->full){
     /* kick: four-on-the-floor, pitch-dropping sine + click */
     float kt=secInBeat;
-    float kf=45.0f+85.0f*expf(-kt*35.0f);
     float kph=2*PI*(45.0f*kt+(85.0f/35.0f)*(1.0f-expf(-kt*35.0f)));
     out += sinf(kph)*expf(-kt*8.0f)*0.85f;
     out += (kt<0.006f?(1.0f-kt/0.006f):0)*0.25f;
@@ -818,7 +860,7 @@ static void audio_cb(void*ud,Uint8*stream,int len){
   (void)ud;
   float*out=(float*)stream; int n=len/8;   /* stereo: 2 floats per frame */
   static double mt=0;
-  float ats=g_ats;
+  float ats=g_ats, mg=g_mute?0.0f:1.0f;
   for(int i=0;i<n;i++){
     /* per-level club track (replaces the old drone). Runs at a constant
      * tempo regardless of the world timescale — only the SFX below detune
@@ -887,8 +929,8 @@ static void audio_cb(void*ud,Uint8*stream,int len){
       sL += vs*voices[v].gl; sR += vs*voices[v].gr;
       voices[v].t += (voices[v].world?ats:1.0f)/44100.0f;
     }
-    out[2*i]   = tanhf(sL*1.1f)*0.82f;
-    out[2*i+1] = tanhf(sR*1.1f)*0.82f;
+    out[2*i]   = tanhf(sL*1.1f)*0.82f*mg;
+    out[2*i+1] = tanhf(sR*1.1f)*0.82f*mg;
   }
 }
 
@@ -2903,6 +2945,7 @@ int main(int argc,char**argv){
   init_shaders();
   printf("[dilation] shaders up\n");
 
+  music_init();   /* parse the note-string melodies into step arrays */
   SDL_AudioSpec want={0},have;
   want.freq=44100; want.format=AUDIO_F32SYS; want.channels=2; want.samples=512; want.callback=audio_cb;
   adev=SDL_OpenAudioDevice(0,0,&want,&have,0);
@@ -2962,6 +3005,7 @@ int main(int argc,char**argv){
             if(d&&gstate==ST_TITLE){ curlevel=ev.key.keysym.sym-SDLK_1;
               if(curlevel>=NLEVEL)curlevel=NLEVEL-1; sfx(V_CLICK); }
             break;
+          case SDLK_m: if(d){ g_mute=!g_mute; printf("[dilation] audio %s\n",g_mute?"muted":"unmuted"); } break;
           case SDLK_LEFT: if(d&&gstate==ST_TITLE){ curlevel=(curlevel+NLEVEL-1)%NLEVEL; sfx(V_CLICK); } break;
           case SDLK_RIGHT:if(d&&gstate==ST_TITLE){ curlevel=(curlevel+1)%NLEVEL; sfx(V_CLICK); } break;
           case SDLK_ESCAPE:
